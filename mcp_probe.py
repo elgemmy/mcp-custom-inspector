@@ -542,6 +542,75 @@ def run_http(args: argparse.Namespace) -> int:
         logger.close()
 
 
+def summarize_payload(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        text = str(payload)
+        return text if len(text) <= 100 else text[:97] + "..."
+
+    if "method" in payload:
+        method = payload.get("method")
+        request_id = payload.get("id")
+        if request_id is not None:
+            return f"{method} id={request_id}"
+        return str(method)
+
+    if "result" in payload:
+        return f"result id={payload.get('id')}"
+
+    if "error" in payload:
+        error = payload.get("error")
+        if isinstance(error, dict):
+            code = error.get("code")
+            message = error.get("message")
+            return f"error id={payload.get('id')} code={code} {message}"
+        return f"error id={payload.get('id')}"
+
+    return "payload"
+
+
+def run_view(args: argparse.Namespace) -> int:
+    path = Path(args.log_file)
+    if not path.exists():
+        raise SystemExit(f"Transcript not found: {path}")
+
+    shown = 0
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            print(f"\n== line {line_number}: invalid JSONL ==")
+            print(str(exc))
+            continue
+
+        direction = event.get("direction", "?")
+        if args.direction and direction != args.direction:
+            continue
+
+        payload = event.get("payload")
+        transport = event.get("transport", "?")
+        ts = event.get("ts", "?")
+        heading = f"{ts} {direction.upper()} {transport} - {summarize_payload(payload)}"
+        print(f"\n== {heading} ==")
+
+        if args.meta:
+            meta = {k: v for k, v in event.items() if k != "payload"}
+            print("-- meta --")
+            print(pretty_json(meta))
+            print("-- payload --")
+
+        if args.compact:
+            print(compact_json(payload))
+        else:
+            print(pretty_json(payload))
+        shown += 1
+
+    if shown == 0:
+        print("No transcript events matched.")
+    return 0
+
+
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--protocol-version", default=LATEST_PROTOCOL_VERSION)
     parser.add_argument("--client-name", default="mcp-probe")
@@ -586,7 +655,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also send MCP-Protocol-Version on the initialize request.",
     )
+
     http.set_defaults(func=run_http)
+
+    view = sub.add_parser("view", help="Pretty-print a JSONL transcript created with --log.")
+    view.add_argument("log_file", help="Transcript JSONL file to view.")
+    view.add_argument(
+        "--direction",
+        choices=["send", "recv", "stderr", "recv-invalid"],
+        help="Only show events with this direction.",
+    )
+    view.add_argument("--meta", action="store_true", help="Show event metadata as well as payloads.")
+    view.add_argument("--compact", action="store_true", help="Print each payload as compact JSON.")
+    view.set_defaults(func=run_view)
 
     return parser
 
