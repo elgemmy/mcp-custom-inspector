@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local evidence logs. Keep them private unless intentionally redacted.
+transcripts/*.jsonl
+!transcripts/.gitkeep
+
+# Local env/secrets used by MCP servers.
+.env
+*.env

@@ -1,0 +1,8 @@
+{
+  "protocolVersion": "2025-06-18",
+  "capabilities": {},
+  "clientInfo": {
+    "name": "mcp-compat-probe",
+    "version": "0.1.0"
+  }
+}
