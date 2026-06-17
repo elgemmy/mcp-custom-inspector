@@ -8,7 +8,6 @@ Valid initialize:
 python3 mcp_probe.py stdio \
   --init-file examples/init-valid.json \
   --no-initialized \
-  --log transcripts/notion-with-version.jsonl \
   --verbose \
   --env NOTION_TOKEN=dummy \
   -- npx -y @notionhq/notion-mcp-server
@@ -20,7 +19,6 @@ Missing `protocolVersion`:
 python3 mcp_probe.py stdio \
   --init-file examples/init-missing-protocol-version.json \
   --no-initialized \
-  --log transcripts/notion-without-version.jsonl \
   --verbose \
   --env NOTION_TOKEN=dummy \
   -- npx -y @notionhq/notion-mcp-server

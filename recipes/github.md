@@ -8,7 +8,6 @@ Valid initialize:
 python3 mcp_probe.py stdio \
   --init-file examples/init-valid.json \
   --no-initialized \
-  --log transcripts/github-with-version.jsonl \
   --verbose \
   --env GITHUB_PERSONAL_ACCESS_TOKEN=dummy \
   -- docker run -i --rm ghcr.io/github/github-mcp-server
@@ -20,7 +19,6 @@ Missing `protocolVersion`:
 python3 mcp_probe.py stdio \
   --init-file examples/init-missing-protocol-version.json \
   --no-initialized \
-  --log transcripts/github-without-version.jsonl \
   --verbose \
   --env GITHUB_PERSONAL_ACCESS_TOKEN=dummy \
   -- docker run -i --rm ghcr.io/github/github-mcp-server

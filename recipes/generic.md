@@ -6,7 +6,6 @@ For npm-based servers:
 python3 mcp_probe.py stdio \
   --init-file examples/init-valid.json \
   --discover \
-  --log transcripts/server-discovery.jsonl \
   --verbose \
   -- npx -y package-name
 ```
@@ -17,7 +16,6 @@ For Docker-based servers:
 python3 mcp_probe.py stdio \
   --init-file examples/init-valid.json \
   --discover \
-  --log transcripts/server-discovery.jsonl \
   --verbose \
   -- docker run -i --rm image-name
 ```
@@ -29,7 +27,6 @@ python3 mcp_probe.py http \
   --url http://127.0.0.1:3000/mcp \
   --init-file examples/init-valid.json \
   --discover \
-  --log transcripts/http-server.jsonl \
   --verbose
 ```
 

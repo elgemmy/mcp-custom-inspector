@@ -13,7 +13,6 @@ It is intentionally small: one Python script, no third-party Python dependencies
 - Optionally sends `notifications/initialized`.
 - Sends raw JSON-RPC objects with `--raw`.
 - Can run simple discovery calls: `tools/list`, `resources/list`, and `prompts/list`.
-- Logs every send/receive event as JSONL for evidence.
 - Includes basic Streamable HTTP probing for HTTP MCP endpoints.
 
 This is not built on top of MCP Inspector. It is a small MCP client/probe.
@@ -26,7 +25,6 @@ Run from this repository:
 python3 mcp_probe.py stdio \
   --init-file examples/init-valid.json \
   --no-initialized \
-  --log transcripts/notion-with-version.jsonl \
   --verbose \
   --env NOTION_TOKEN=dummy \
   -- npx -y @notionhq/notion-mcp-server
@@ -38,17 +36,13 @@ Then run the same server with a deliberately invalid initialize payload:
 python3 mcp_probe.py stdio \
   --init-file examples/init-missing-protocol-version.json \
   --no-initialized \
-  --log transcripts/notion-without-version.jsonl \
   --verbose \
   --env NOTION_TOKEN=dummy \
   -- npx -y @notionhq/notion-mcp-server
 ```
 
-Compare the transcripts:
 
 ```bash
-cat transcripts/notion-with-version.jsonl
-cat transcripts/notion-without-version.jsonl
 ```
 
 The first run should show a successful `initialize` response with a `result`. The second run should show a JSON-RPC `error` response if the server enforces the required `protocolVersion`.
@@ -98,7 +92,6 @@ List tools, resources, and prompts after initialization:
 python3 mcp_probe.py stdio \
   --init-file examples/init-valid.json \
   --discover \
-  --log transcripts/server-discovery.jsonl \
   --verbose \
   -- npx -y package-name
 ```
@@ -109,7 +102,6 @@ Send a raw JSON-RPC request:
 python3 mcp_probe.py stdio \
   --init-file examples/init-valid.json \
   --raw '{"jsonrpc":"2.0","id":99,"method":"tools/list","params":{}}' \
-  --log transcripts/raw-tools-list.jsonl \
   --verbose \
   -- npx -y package-name
 ```
@@ -142,7 +134,6 @@ python3 mcp_probe.py http \
   --init-file examples/init-valid.json \
   --discover \
   --header 'Authorization: Bearer YOUR_TOKEN' \
-  --log transcripts/http-server.jsonl \
   --verbose
 ```
 
@@ -151,13 +142,11 @@ python3 mcp_probe.py http \
 This repo works well with coding agents. Ask the agent for a command like:
 
 ```text
-Generate an mcp_probe.py command that launches the GitHub MCP server and sends examples/init-missing-protocol-version.json as the initialize payload. Include any required env vars as --env placeholders and write logs under transcripts/.
 ```
 
 Then review the generated command before running it, especially any tokens or shell arguments.
 
 ## Notes
 
-- `transcripts/*.jsonl` is gitignored by default because logs may contain local paths, tokens, server output, or tool responses.
 - Use dummy tokens when only testing the MCP handshake.
 - Use real tokens only when you intentionally want to inspect authenticated tools or resources.

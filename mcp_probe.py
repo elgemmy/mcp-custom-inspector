@@ -92,20 +92,13 @@ def parse_header(values: list[str] | None) -> dict[str, str]:
 
 
 class Logger:
-    def __init__(self, path: str | None, verbose: bool) -> None:
+    def __init__(self, verbose: bool) -> None:
         self.verbose = verbose
         self._lock = threading.Lock()
-        self._file = None
-        if path:
-            log_path = Path(path)
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            self._file = log_path.open("a", encoding="utf-8")
-
-    def close(self) -> None:
-        if self._file:
-            self._file.close()
 
     def event(self, direction: str, transport: str, payload: Any, **meta: Any) -> None:
+        if not self.verbose:
+            return
         record = {
             "ts": now_iso(),
             "direction": direction,
@@ -113,17 +106,12 @@ class Logger:
             "payload": payload,
             **{k: v for k, v in meta.items() if v is not None},
         }
-        line = compact_json(record)
+        prefix = f"[{record['ts']}] {direction.upper()} {transport}"
         with self._lock:
-            if self._file:
-                self._file.write(line + "\n")
-                self._file.flush()
-            if self.verbose:
-                prefix = f"[{record['ts']}] {direction.upper()} {transport}"
-                if direction == "stderr":
-                    print(f"{prefix}: {payload}", file=sys.stderr)
-                else:
-                    print(f"{prefix}:\n{pretty_json(payload)}", file=sys.stderr)
+            if direction == "stderr":
+                print(f"{prefix}: {payload}", file=sys.stderr)
+            else:
+                print(f"{prefix}:\n{pretty_json(payload)}", file=sys.stderr)
 
 
 def default_initialize_params(args: argparse.Namespace) -> Json:
@@ -432,7 +420,7 @@ def run_stdio(args: argparse.Namespace) -> int:
     if not command:
         raise SystemExit("Missing server command. Put it after --, for example: -- npx -y package-name")
 
-    logger = Logger(args.log, args.verbose)
+    logger = Logger(args.verbose)
     probe = StdioMcpProbe(command, parse_key_value(args.env, "--env"), logger)
     try:
         probe.start()
@@ -459,7 +447,6 @@ def run_stdio(args: argparse.Namespace) -> int:
         return 0
     finally:
         probe.close()
-        logger.close()
 
 
 def interactive_stdio(probe: StdioMcpProbe, timeout: float) -> None:
@@ -503,7 +490,7 @@ def interactive_stdio(probe: StdioMcpProbe, timeout: float) -> None:
 
 
 def run_http(args: argparse.Namespace) -> int:
-    logger = Logger(args.log, args.verbose)
+    logger = Logger(args.verbose)
     probe = HttpMcpProbe(args.url, parse_header(args.header), logger)
     try:
         init = initialize_request(args)
@@ -539,76 +526,7 @@ def run_http(args: argparse.Namespace) -> int:
             })
         return 0
     finally:
-        logger.close()
-
-
-def summarize_payload(payload: Any) -> str:
-    if not isinstance(payload, dict):
-        text = str(payload)
-        return text if len(text) <= 100 else text[:97] + "..."
-
-    if "method" in payload:
-        method = payload.get("method")
-        request_id = payload.get("id")
-        if request_id is not None:
-            return f"{method} id={request_id}"
-        return str(method)
-
-    if "result" in payload:
-        return f"result id={payload.get('id')}"
-
-    if "error" in payload:
-        error = payload.get("error")
-        if isinstance(error, dict):
-            code = error.get("code")
-            message = error.get("message")
-            return f"error id={payload.get('id')} code={code} {message}"
-        return f"error id={payload.get('id')}"
-
-    return "payload"
-
-
-def run_view(args: argparse.Namespace) -> int:
-    path = Path(args.log_file)
-    if not path.exists():
-        raise SystemExit(f"Transcript not found: {path}")
-
-    shown = 0
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError as exc:
-            print(f"\n== line {line_number}: invalid JSONL ==")
-            print(str(exc))
-            continue
-
-        direction = event.get("direction", "?")
-        if args.direction and direction != args.direction:
-            continue
-
-        payload = event.get("payload")
-        transport = event.get("transport", "?")
-        ts = event.get("ts", "?")
-        heading = f"{ts} {direction.upper()} {transport} - {summarize_payload(payload)}"
-        print(f"\n== {heading} ==")
-
-        if args.meta:
-            meta = {k: v for k, v in event.items() if k != "payload"}
-            print("-- meta --")
-            print(pretty_json(meta))
-            print("-- payload --")
-
-        if args.compact:
-            print(compact_json(payload))
-        else:
-            print(pretty_json(payload))
-        shown += 1
-
-    if shown == 0:
-        print("No transcript events matched.")
-    return 0
+        pass
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -631,7 +549,6 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--discover", action="store_true", help="After initialize, call tools/list, resources/list, prompts/list.")
     parser.add_argument("--no-initialized", action="store_true", help="Do not send notifications/initialized after initialize.")
     parser.add_argument("--timeout", type=float, default=15.0)
-    parser.add_argument("--log", help="Append JSONL transcript to this file.")
     parser.add_argument("--verbose", action="store_true", help="Print every send/receive event to stderr.")
 
 
@@ -657,17 +574,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     http.set_defaults(func=run_http)
-
-    view = sub.add_parser("view", help="Pretty-print a JSONL transcript created with --log.")
-    view.add_argument("log_file", help="Transcript JSONL file to view.")
-    view.add_argument(
-        "--direction",
-        choices=["send", "recv", "stderr", "recv-invalid"],
-        help="Only show events with this direction.",
-    )
-    view.add_argument("--meta", action="store_true", help="Show event metadata as well as payloads.")
-    view.add_argument("--compact", action="store_true", help="Print each payload as compact JSON.")
-    view.set_defaults(func=run_view)
 
     return parser
 
