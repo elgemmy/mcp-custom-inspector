@@ -5,6 +5,8 @@ import unittest
 from mcp_probe_core.errors import ConfigurationError
 from mcp_probe_core.protocol import (
     LATEST_PROTOCOL_VERSION,
+    MAX_JSON_DEPTH,
+    MAX_JSON_NODES,
     SUPPORTED_PROTOCOL_VERSIONS,
     classify_message,
     decorate_modern_request,
@@ -13,6 +15,7 @@ from mcp_probe_core.protocol import (
     message_id,
     modern_http_headers,
     profile_for,
+    strict_json_loads,
 )
 
 
@@ -53,6 +56,23 @@ class ProtocolProfileTests(unittest.TestCase):
 
 
 class ProtocolMessageTests(unittest.TestCase):
+    def test_strict_json_rejects_duplicate_names_and_non_finite_numbers(self) -> None:
+        for text in ('{"id":1,"id":2}', '{"value":NaN}', '{"value":Infinity}', '1e9999'):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    strict_json_loads(text)
+
+    def test_strict_json_enforces_depth_and_node_bounds_iteratively(self) -> None:
+        within_depth = "[" * (MAX_JSON_DEPTH - 1) + "0" + "]" * (MAX_JSON_DEPTH - 1)
+        self.assertIsInstance(strict_json_loads(within_depth), list)
+        too_deep = "[" * MAX_JSON_DEPTH + "0" + "]" * MAX_JSON_DEPTH
+        with self.assertRaisesRegex(ValueError, "depth"):
+            strict_json_loads(too_deep)
+
+        too_many_nodes = "[" + ",".join("0" for _ in range(MAX_JSON_NODES)) + "]"
+        with self.assertRaisesRegex(ValueError, "node count"):
+            strict_json_loads(too_many_nodes)
+
     def test_initialize_builder_keeps_caller_values(self) -> None:
         message = make_initialize_request(
             "2025-11-25",

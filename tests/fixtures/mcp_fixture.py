@@ -53,6 +53,7 @@ STDIO_PROFILES = (
     "stdio-non-utf8",
     "stdio-out-of-order",
     "stdio-notification-response",
+    "stdio-batch-server-request",
 )
 
 HTTP_PROFILES = (
@@ -65,6 +66,9 @@ HTTP_PROFILES = (
     "http-error",
     "http-empty",
     "http-wrong-content-type",
+    "http-notification-reject",
+    "http-wrong-id",
+    "http-wrong-then-correct",
 )
 
 ALL_PROFILES = STDIO_PROFILES + HTTP_PROFILES
@@ -101,10 +105,16 @@ class FixtureConfig:
     delay: float = 0.20
     chunk_delay: float = 0.02
     crash_exit_code: int = 17
+    eof_exit_code: int = 0
     mismatch_offset: int = 1000
     capability_mismatch_mode: str = "unadvertised"
+    capability_shape_mode: str = "normal"
     pagination_mode: str = "normal"
     tool_schema_mode: str = "normal"
+    modern_ttl_mode: str = "normal"
+    server_request_mode: str = "none"
+    notification_mode: str = "none"
+    mismatch_then_correct: bool = False
     http_error_status: int = 503
     empty_status: int = 202
     session_id: str = "fixture-session-id"
@@ -121,15 +131,44 @@ class FixtureConfig:
         if self.tool_schema_mode not in {
             "normal",
             "missing-input",
+            "missing-type",
             "invalid-required",
             "duplicate-names",
             "bad-header",
+            "page-two-missing-input",
+            "cross-page-duplicate",
         }:
             raise ValueError(f"Unknown tool schema mode: {self.tool_schema_mode}")
         if self.capability_mismatch_mode not in {"unadvertised", "unimplemented"}:
             raise ValueError(
                 f"Unknown capability mismatch mode: {self.capability_mismatch_mode}"
             )
+        if self.capability_shape_mode not in {"normal", "descriptor", "flag"}:
+            raise ValueError(f"Unknown capability shape mode: {self.capability_shape_mode}")
+        if self.modern_ttl_mode not in {"normal", "float", "negative", "string"}:
+            raise ValueError(f"Unknown modern ttl mode: {self.modern_ttl_mode}")
+        if self.server_request_mode not in {
+            "none",
+            "roots-post",
+            "roots-early",
+            "ping-post",
+            "unsupported-post",
+            "invalid-id",
+            "modern-forbidden",
+        }:
+            raise ValueError(f"Unknown server request mode: {self.server_request_mode}")
+        if self.notification_mode not in {
+            "none",
+            "logging",
+            "progress",
+            "tools",
+            "resources",
+            "prompts",
+            "resource-updated",
+        }:
+            raise ValueError(f"Unknown notification mode: {self.notification_mode}")
+        if self.profile == "stdio-server-request" and self.server_request_mode == "none":
+            self.server_request_mode = "roots-post"
         if not 100 <= self.http_error_status <= 599:
             raise ValueError("HTTP error status must be between 100 and 599")
         if not 100 <= self.empty_status <= 599:
@@ -149,6 +188,8 @@ class FixtureState:
     pending_initialize: JsonObject | None = None
     pending_out_of_order: list[JsonObject] = field(default_factory=list)
     fault_emitted: bool = False
+    server_request_emitted: bool = False
+    notification_emitted: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def record_message(self, message: Any) -> None:
@@ -217,10 +258,10 @@ class FixtureEngine:
                 self._result(
                     request_id,
                     {
-                        "resultType": "serverDiscovery",
+                        "resultType": "complete",
                         "supportedVersions": ["2026-07-28"],
-                        "capabilities": default_capabilities(),
-                        "ttlMs": 1_000,
+                        "capabilities": self._capabilities(),
+                        "ttlMs": self._modern_ttl_ms(),
                         "cacheScope": "private",
                         "_meta": {
                             "io.modelcontextprotocol/serverInfo": {
@@ -235,7 +276,31 @@ class FixtureEngine:
         if method == "initialize":
             self.state.initialized = True
             response = self._initialize_response(message)
-            if self.config.profile == "stdio-server-request":
+            if self.config.profile == "stdio-batch-server-request":
+                self.state.pending_initialize = response
+                self.state.server_request_emitted = True
+                return [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "fixture-batch-ping",
+                        "method": "ping",
+                        "params": {},
+                    },
+                    {
+                        "jsonrpc": "2.0",
+                        "id": self.SERVER_REQUEST_ID,
+                        "method": "roots/list",
+                        "params": {},
+                    },
+                ]
+            if (
+                self.config.profile == "stdio-mismatched-id"
+                and self.config.mismatch_then_correct
+            ):
+                correct = json.loads(compact_json(response))
+                correct["id"] = message.get("id")
+                return [response, correct]
+            if self.config.server_request_mode == "roots-early":
                 self.state.pending_initialize = response
                 return [
                     {
@@ -253,21 +318,23 @@ class FixtureEngine:
             return [self._error(request_id, -32002, "Initialized notification required")]
 
         if method == "ping":
-            return [self._result(request_id, {})]
+            return [self._result(request_id, self._modern_result({}, cacheable=False))]
         if method == "tools/list":
             if (
                 self.config.profile == "stdio-capability-mismatch"
                 and self.config.capability_mismatch_mode == "unimplemented"
             ):
                 return [self._error(request_id, -32601, "Method not found: tools/list")]
-            return [
+            responses = [
                 self._result(
                     request_id,
                     self._modern_result(
-                        self._tools_page(message.get("params")), "toolsList"
+                        self._tools_page(message.get("params"))
                     ),
                 )
             ]
+            server_request = self._post_server_request()
+            return ([server_request] if server_request else []) + responses
         if method == "tools/call":
             params = message.get("params") if isinstance(message.get("params"), dict) else {}
             name = params.get("name")
@@ -292,7 +359,7 @@ class FixtureEngine:
             return [
                 self._result(
                     request_id,
-                    self._modern_result({"resources": []}, "resourcesList"),
+                    self._modern_result({"resources": []}),
                 )
             ]
         if method == "resources/templates/list":
@@ -300,7 +367,7 @@ class FixtureEngine:
                 self._result(
                     request_id,
                     self._modern_result(
-                        {"resourceTemplates": []}, "resourceTemplatesList"
+                        {"resourceTemplates": []}
                     ),
                 )
             ]
@@ -308,16 +375,60 @@ class FixtureEngine:
             return [
                 self._result(
                     request_id,
-                    self._modern_result({"prompts": []}, "promptsList"),
+                    self._modern_result({"prompts": []}),
                 )
             ]
 
         return [self._error(request_id, -32601, f"Method not found: {method}")]
 
-    def _modern_result(self, result: JsonObject, result_type: str) -> JsonObject:
+    def _modern_result(
+        self, result: JsonObject, *, cacheable: bool = True
+    ) -> JsonObject:
         if self.modern:
-            return {"resultType": result_type, **result}
+            metadata: JsonObject = {"resultType": "complete"}
+            if cacheable:
+                metadata.update(
+                    {"ttlMs": self._modern_ttl_ms(), "cacheScope": "private"}
+                )
+            return {**metadata, **result}
         return result
+
+    def _modern_ttl_ms(self) -> Any:
+        return {
+            "normal": 1_000,
+            "float": 1_000.5,
+            "negative": -1,
+            "string": "1000",
+        }[self.config.modern_ttl_mode]
+
+    def _capabilities(self) -> JsonObject:
+        capabilities = default_capabilities()
+        if self.config.capability_shape_mode == "descriptor":
+            capabilities["tools"] = True
+        elif self.config.capability_shape_mode == "flag":
+            capabilities["tools"]["listChanged"] = "yes"
+        return capabilities
+
+    def _post_server_request(self) -> JsonObject | None:
+        mode = self.config.server_request_mode
+        if self.state.server_request_emitted or mode not in {
+            "roots-post",
+            "ping-post",
+            "unsupported-post",
+            "invalid-id",
+            "modern-forbidden",
+        }:
+            return None
+        self.state.server_request_emitted = True
+        method = {
+            "roots-post": "roots/list",
+            "ping-post": "ping",
+            "unsupported-post": "fixture/unsupported-client-method",
+            "invalid-id": "roots/list",
+            "modern-forbidden": "ping",
+        }[mode]
+        request_id: Any = True if mode == "invalid-id" else self.SERVER_REQUEST_ID
+        return {"jsonrpc": "2.0", "id": request_id, "method": method, "params": {}}
 
     def _handle_client_response(self, message: JsonObject) -> list[JsonObject]:
         if message.get("id") == self.SERVER_REQUEST_ID and self.state.pending_initialize is not None:
@@ -333,7 +444,7 @@ class FixtureEngine:
         protocol_version = self.config.protocol_version or (
             requested_version if isinstance(requested_version, str) else DEFAULT_PROTOCOL_VERSION
         )
-        capabilities = default_capabilities()
+        capabilities = self._capabilities()
         if (
             self.config.profile == "stdio-capability-mismatch"
             and self.config.capability_mismatch_mode == "unadvertised"
@@ -361,6 +472,8 @@ class FixtureEngine:
             tools = [fixture_tool("fixture_echo")]
             if self.config.tool_schema_mode == "missing-input":
                 tools[0].pop("inputSchema")
+            elif self.config.tool_schema_mode == "missing-type":
+                tools[0]["inputSchema"].pop("type")
             elif self.config.tool_schema_mode == "invalid-required":
                 tools[0]["inputSchema"]["required"] = "text"
             elif self.config.tool_schema_mode == "duplicate-names":
@@ -376,7 +489,14 @@ class FixtureEngine:
             return {"tools": [fixture_tool("fixture_page_one")], "nextCursor": next_cursor}
 
         if cursor == "page-2":
-            page: JsonObject = {"tools": [fixture_tool("fixture_page_two")]}
+            second_tool = fixture_tool(
+                "fixture_page_one"
+                if self.config.tool_schema_mode == "cross-page-duplicate"
+                else "fixture_page_two"
+            )
+            if self.config.tool_schema_mode == "page-two-missing-input":
+                second_tool.pop("inputSchema")
+            page: JsonObject = {"tools": [second_tool]}
             if self.config.pagination_mode == "repeat":
                 page["nextCursor"] = "page-2"
             elif self.config.pagination_mode == "loop":
@@ -423,10 +543,45 @@ def _write_stderr(text: str) -> None:
     sys.stderr.buffer.flush()
 
 
+def _configured_notification(mode: str) -> JsonObject | None:
+    values: dict[str, JsonObject] = {
+        "logging": {
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {"level": "info", "data": "unsolicited fixture log"},
+        },
+        "progress": {
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": {"progressToken": "unsolicited", "progress": 1},
+        },
+        "tools": {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"},
+        "resources": {
+            "jsonrpc": "2.0",
+            "method": "notifications/resources/list_changed",
+        },
+        "prompts": {
+            "jsonrpc": "2.0",
+            "method": "notifications/prompts/list_changed",
+        },
+        "resource-updated": {
+            "jsonrpc": "2.0",
+            "method": "notifications/resources/updated",
+            "params": {"uri": "file:///fixture"},
+        },
+    }
+    return values.get(mode)
+
+
 def _emit_stdio_response(engine: FixtureEngine, response: JsonObject) -> None:
     config = engine.config
     state = engine.state
     encoded = compact_json(response).encode("utf-8") + b"\n"
+
+    notification = _configured_notification(config.notification_mode)
+    if notification is not None and state.initialized and not state.notification_emitted:
+        state.notification_emitted = True
+        _write_stdout_bytes(compact_json(notification).encode("utf-8") + b"\n")
 
     if config.profile == "stdio-delayed-response":
         time.sleep(config.delay)
@@ -469,7 +624,24 @@ def run_stdio_fixture(config: FixtureConfig) -> int:
             _emit_stdio_response(engine, FixtureEngine._error(None, -32700, "Parse error"))
             continue
 
+        if config.profile == "stdio-batch-server-request" and isinstance(message, list):
+            engine.state.server_request_responses.extend(
+                item for item in message if isinstance(item, dict)
+            )
+            pending = engine.state.pending_initialize
+            engine.state.pending_initialize = None
+            if pending is not None:
+                _emit_stdio_response(engine, pending)
+            continue
+
         responses = engine.handle(message)
+        if (
+            config.profile == "stdio-batch-server-request"
+            and isinstance(message, dict)
+            and message.get("method") == "initialize"
+        ):
+            _write_stdout_bytes(compact_json(responses).encode("utf-8") + b"\n")
+            continue
         if (
             config.profile == "stdio-out-of-order"
             and isinstance(message, dict)
@@ -485,7 +657,7 @@ def run_stdio_fixture(config: FixtureConfig) -> int:
 
         for response in responses:
             _emit_stdio_response(engine, response)
-    return 0
+    return config.eof_exit_code
 
 
 class FixtureHttpServer(ThreadingHTTPServer):
@@ -544,6 +716,20 @@ class FixtureHttpHandler(BaseHTTPRequestHandler):
         if self.server.config.profile == "http-empty":
             self._send_bytes(self.server.config.empty_status, b"", None)
             return
+        if (
+            self.server.config.profile == "http-notification-reject"
+            and isinstance(message, dict)
+            and isinstance(message.get("method"), str)
+            and "id" not in message
+        ):
+            self._send_json(
+                400,
+                {
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Notification rejected"},
+                },
+            )
+            return
 
         responses = self.server.engine.handle(message)
         if self.server.config.profile == "http-session" and self._is_initialize(message):
@@ -562,6 +748,21 @@ class FixtureHttpHandler(BaseHTTPRequestHandler):
             and responses[0]["error"].get("code") == -32601
         ):
             response_status = 404
+
+        if self.server.config.profile in {"http-wrong-id", "http-wrong-then-correct"}:
+            correct = responses[0]
+            wrong = json.loads(compact_json(correct))
+            wrong["id"] = self.server.engine._mismatched_id(correct.get("id"))
+            if self.server.config.profile == "http-wrong-id":
+                responses = [wrong]
+            else:
+                self._send_bytes(
+                    response_status,
+                    self._encode_sse([wrong, correct]),
+                    "text/event-stream",
+                    extra_headers,
+                )
+                return
 
         profile = self.server.config.profile
         if profile in {"http-sse", "http-sse-multi"}:
@@ -714,10 +915,16 @@ def _config_from_args(args: argparse.Namespace) -> FixtureConfig:
         delay=args.delay,
         chunk_delay=args.chunk_delay,
         crash_exit_code=args.crash_exit_code,
+        eof_exit_code=args.eof_exit_code,
         mismatch_offset=args.mismatch_offset,
         capability_mismatch_mode=args.capability_mismatch_mode,
+        capability_shape_mode=args.capability_shape_mode,
         pagination_mode=args.pagination_mode,
         tool_schema_mode=args.tool_schema_mode,
+        modern_ttl_mode=args.modern_ttl_mode,
+        server_request_mode=args.server_request_mode,
+        notification_mode=args.notification_mode,
+        mismatch_then_correct=args.mismatch_then_correct,
         http_error_status=args.http_error_status,
         empty_status=args.empty_status,
         session_id=args.session_id,
@@ -732,11 +939,17 @@ def _add_config_args(parser: argparse.ArgumentParser, profiles: tuple[str, ...])
     parser.add_argument("--delay", type=float, default=0.20)
     parser.add_argument("--chunk-delay", type=float, default=0.02)
     parser.add_argument("--crash-exit-code", type=int, default=17)
+    parser.add_argument("--eof-exit-code", type=int, default=0)
     parser.add_argument("--mismatch-offset", type=int, default=1000)
     parser.add_argument(
         "--capability-mismatch-mode",
         choices=["unadvertised", "unimplemented"],
         default="unadvertised",
+    )
+    parser.add_argument(
+        "--capability-shape-mode",
+        choices=["normal", "descriptor", "flag"],
+        default="normal",
     )
     parser.add_argument(
         "--pagination-mode",
@@ -748,12 +961,47 @@ def _add_config_args(parser: argparse.ArgumentParser, profiles: tuple[str, ...])
         choices=[
             "normal",
             "missing-input",
+            "missing-type",
             "invalid-required",
             "duplicate-names",
             "bad-header",
+            "page-two-missing-input",
+            "cross-page-duplicate",
         ],
         default="normal",
     )
+    parser.add_argument(
+        "--modern-ttl-mode",
+        choices=["normal", "float", "negative", "string"],
+        default="normal",
+    )
+    parser.add_argument(
+        "--server-request-mode",
+        choices=[
+            "none",
+            "roots-post",
+            "roots-early",
+            "ping-post",
+            "unsupported-post",
+            "invalid-id",
+            "modern-forbidden",
+        ],
+        default="none",
+    )
+    parser.add_argument(
+        "--notification-mode",
+        choices=[
+            "none",
+            "logging",
+            "progress",
+            "tools",
+            "resources",
+            "prompts",
+            "resource-updated",
+        ],
+        default="none",
+    )
+    parser.add_argument("--mismatch-then-correct", action="store_true")
     parser.add_argument("--http-error-status", type=int, default=503)
     parser.add_argument("--empty-status", type=int, default=202)
     parser.add_argument("--session-id", default="fixture-session-id")

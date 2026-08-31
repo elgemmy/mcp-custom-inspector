@@ -393,14 +393,17 @@ def inspect_tool_schemas(tools: Any) -> tuple[SchemaIssue, ...]:
             )
         else:
             input_schema = tool["inputSchema"]
-            if "type" in input_schema and input_schema["type"] != "object":
+            # MCP tool descriptors require the input schema root to declare an
+            # object explicitly.  This is narrower than general JSON Schema,
+            # where omitting ``type`` can still describe an object indirectly.
+            if input_schema.get("type") != "object":
                 issues.append(
                     _issue(
                         "TOOL_INPUT_SCHEMA_TYPE_NOT_OBJECT",
                         "FAIL",
                         "normative",
                         _child_path(input_path, "type"),
-                        "Tool inputSchema.type must be 'object' when present.",
+                        "Tool inputSchema.type is required and must be 'object'.",
                     )
                 )
 

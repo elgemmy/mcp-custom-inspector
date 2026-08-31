@@ -1310,6 +1310,15 @@ def _validate_existing_report_path(report_path: Path) -> None:
     avoids trusting a path-only ``stat`` result.
     """
 
+    try:
+        path_stat = os.lstat(report_path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(path_stat.st_mode):
+        raise ConfigurationError(
+            f"Report destination is not a safe regular file (symbolic link): {report_path}"
+        )
+
     flags = getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     if hasattr(os, "O_PATH"):
         flags |= os.O_PATH
@@ -1317,8 +1326,10 @@ def _validate_existing_report_path(report_path: Path) -> None:
         flags |= os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(report_path, flags)
-    except FileNotFoundError:
-        return
+    except FileNotFoundError as exc:
+        raise ConfigurationError(
+            f"Report destination changed during validation: {report_path}"
+        ) from exc
     except OSError as exc:
         raise ConfigurationError(
             f"Report destination is not a safe regular file: {report_path}"

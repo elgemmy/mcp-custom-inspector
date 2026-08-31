@@ -7,6 +7,8 @@ Callers that ask for exact-wire behavior must be able to bypass these helpers.
 from __future__ import annotations
 
 import base64
+import json
+import math
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -15,6 +17,12 @@ from .errors import ConfigurationError
 
 
 JsonObject = dict[str, Any]
+
+# These are parser safety limits, not MCP protocol limits.  They apply to every
+# structured JSON input path so a small wire body cannot create an excessively
+# deep or node-heavy Python object graph.
+MAX_JSON_DEPTH = 100
+MAX_JSON_NODES = 100_000
 
 LATEST_PROTOCOL_VERSION = "2026-07-28"
 SUPPORTED_PROTOCOL_VERSIONS = (
@@ -36,6 +44,7 @@ class ProtocolProfile:
     http_sessions: bool
     protocol_header: bool
     server_requests: bool
+    batch_receive_required: bool = False
 
     @property
     def modern(self) -> bool:
@@ -47,7 +56,7 @@ PROTOCOL_PROFILES: dict[str, ProtocolProfile] = {
         "2024-11-05", "legacy", True, True, False, False, False, True
     ),
     "2025-03-26": ProtocolProfile(
-        "2025-03-26", "legacy", True, True, True, True, False, True
+        "2025-03-26", "legacy", True, True, True, True, False, True, True
     ),
     "2025-06-18": ProtocolProfile(
         "2025-06-18", "legacy", True, True, True, True, True, True
@@ -189,6 +198,11 @@ def modern_http_headers(message: JsonObject, version: str) -> dict[str, str]:
     method = message_method(message)
     if not method:
         return {"MCP-Protocol-Version": version}
+    if not all(0x21 <= ord(character) <= 0x7E for character in method):
+        raise ConfigurationError(
+            "Modern HTTP cannot mirror this JSON-RPC method in Mcp-Method: "
+            "only non-space visible ASCII is permitted."
+        )
     headers = {
         "MCP-Protocol-Version": version,
         "Mcp-Method": method,
@@ -216,3 +230,61 @@ def response_error_code(response: Any) -> int | None:
         return None
     code = response["error"].get("code")
     return code if isinstance(code, int) and not isinstance(code, bool) else None
+
+
+def strict_json_loads(text: str) -> Any:
+    """Decode finite JSON with unique names and a bounded object graph.
+
+    The standard library decoder intentionally accepts duplicate object names
+    and JavaScript numeric constants by default.  Both are ambiguous on a
+    protocol wire, so the probe rejects them consistently across transports,
+    scenarios, replay, and transcript loading.
+    """
+
+    def finite_float(value: str) -> float:
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("number is outside the finite JSON range")
+        return number
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON numeric constant {value}")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> JsonObject:
+        result: JsonObject = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate object key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(
+            text,
+            parse_float=finite_float,
+            parse_constant=reject_constant,
+            object_pairs_hook=unique_object,
+        )
+    except RecursionError as exc:
+        raise ValueError(
+            f"JSON nesting exceeds the supported depth of {MAX_JSON_DEPTH}"
+        ) from exc
+
+    nodes = 0
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        node, depth = stack.pop()
+        nodes += 1
+        if nodes > MAX_JSON_NODES:
+            raise ValueError(
+                f"JSON value exceeds the supported node count of {MAX_JSON_NODES}"
+            )
+        if depth > MAX_JSON_DEPTH:
+            raise ValueError(
+                f"JSON nesting exceeds the supported depth of {MAX_JSON_DEPTH}"
+            )
+        if isinstance(node, dict):
+            stack.extend((child, depth + 1) for child in node.values())
+        elif isinstance(node, list):
+            stack.extend((child, depth + 1) for child in node)
+    return value

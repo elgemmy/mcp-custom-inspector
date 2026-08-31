@@ -103,6 +103,17 @@ class CompatibilityChecksStdioTests(unittest.TestCase):
         self.assertEqual(finding(report, "CAPABILITY_TOOLS_LIST").status, "FAIL")
         self.assertIn("without", finding(report, "CAPABILITY_TOOLS_LIST").summary)
 
+    def test_malformed_capability_descriptor_and_flag_are_negotiation_failures(self):
+        for mode in ("descriptor", "flag"):
+            with self.subTest(mode=mode):
+                report, _ = self.run_stdio(
+                    "stdio-good-legacy",
+                    extra=("--capability-shape-mode", mode),
+                )
+                issue = finding(report, "NEGOTIATION_CAPABILITIES")
+                self.assertEqual(issue.status, "FAIL")
+                self.assertTrue(issue.evidence)
+
     def test_pagination_collects_pages_and_detects_malformed_cursor(self):
         good, _ = self.run_stdio("stdio-pagination")
         self.assertEqual(good.exit_code, 0)
@@ -147,12 +158,32 @@ class CompatibilityChecksStdioTests(unittest.TestCase):
         self.assertFalse(report.errors)
         self.assertEqual(report.exit_code, 1)
 
+    def test_wrong_then_correct_id_is_still_reported(self):
+        report, _ = self.run_stdio(
+            "stdio-mismatched-id", extra=("--mismatch-then-correct",)
+        )
+        self.assertEqual(finding(report, "JSONRPC_RESPONSE_ID").status, "FAIL")
+        self.assertFalse(report.errors)
+        self.assertEqual(report.exit_code, 1)
+
     def test_child_crash_has_transport_exit_and_cleanup(self):
         report, _ = self.run_stdio("stdio-crash", timeout=0.25)
         self.assertEqual(report.exit_code, 3)
         self.assertIn("TRANSPORT_STDIO_CHILD_EXIT", [error.code for error in report.errors])
         self.assertEqual(finding(report, "STDIO_CHILD_EXIT").status, "FAIL")
         self.assertIn(finding(report, "STDIO_CLEANUP").status, {"PASS", "WARN"})
+
+    def test_nonzero_exit_after_successful_protocol_run_is_transport_failure(self):
+        report, _ = self.run_stdio(
+            "stdio-good-legacy",
+            extra=("--eof-exit-code", "29"),
+        )
+        self.assertEqual(report.exit_code, 3)
+        self.assertIn(
+            "TRANSPORT_STDIO_CHILD_EXIT", [error.code for error in report.errors]
+        )
+        self.assertEqual(finding(report, "STDIO_CHILD_EXIT").actual, 29)
+        self.assertEqual(finding(report, "STDIO_CLEANUP").status, "PASS")
 
     def test_delayed_stdio_response_has_timeout_taxonomy(self):
         report, _ = self.run_stdio("stdio-delayed-response", timeout=0.04)
@@ -169,6 +200,120 @@ class CompatibilityChecksStdioTests(unittest.TestCase):
         self.assertEqual(report.exit_code, 0)
         self.assertEqual(finding(report, "CLIENT_REQUEST_ROOTS_LIST").status, "PASS")
         self.assertEqual(finding(report, "CAPABILITY_ROOTS").status, "PASS")
+
+    def test_ping_and_unsupported_server_requests_are_correlated_to_responses(self):
+        ping, _ = self.run_stdio(
+            "stdio-good-legacy", extra=("--server-request-mode", "ping-post")
+        )
+        self.assertEqual(finding(ping, "CLIENT_REQUEST_PING").status, "PASS")
+
+        unsupported, _ = self.run_stdio(
+            "stdio-good-legacy",
+            extra=("--server-request-mode", "unsupported-post"),
+        )
+        self.assertEqual(
+            finding(unsupported, "CLIENT_REQUEST_UNSUPPORTED").status, "PASS"
+        )
+
+    def test_server_request_handler_failure_cannot_be_reported_as_pass(self):
+        recorder = EventRecorder()
+        transport = StdioTransport(
+            stdio_fixture_command(
+                "stdio-good-legacy", "--server-request-mode", "roots-post"
+            ),
+            {},
+            recorder,
+        )
+        session = McpSession(
+            transport,
+            SessionConfig(
+                LEGACY,
+                client_capabilities={"roots": {}},
+                roots=[{"uri": "file:///fixture"}],
+            ),
+            recorder,
+        )
+
+        def broken_handler(_message):
+            raise RuntimeError("fixture handler failure")
+
+        session._handle_legacy_server_request = broken_handler  # type: ignore[method-assign]
+        report = run_check(session, timeout=0.6, max_pages=10)
+        self.assertEqual(finding(report, "CLIENT_REQUEST_ROOTS_LIST").status, "FAIL")
+        self.assertTrue(
+            any(
+                event.get("classification") == "server_request_handler_error"
+                for event in recorder.events
+            )
+        )
+
+    def test_pre_initialized_roots_is_rejected_without_claiming_roots_success(self):
+        report, recorder = self.run_stdio(
+            "stdio-server-request",
+            extra=("--server-request-mode", "roots-early"),
+            client_capabilities={"roots": {}},
+        )
+        self.assertEqual(finding(report, "LIFECYCLE_ORDERING").status, "WARN")
+        self.assertEqual(finding(report, "CLIENT_REQUEST_ROOTS_LIST").status, "WARN")
+        self.assertEqual(finding(report, "CAPABILITY_ROOTS").status, "SKIP")
+        response = next(
+            event
+            for event in recorder.events
+            if event.get("direction") == "client_to_server"
+            and isinstance(event.get("payload"), dict)
+            and event["payload"].get("id") == "fixture-roots-request"
+        )
+        self.assertEqual(response["payload"]["error"]["code"], -32002)
+
+    def test_malformed_server_request_is_evidence_backed_and_rejected(self):
+        report, recorder = self.run_stdio(
+            "stdio-good-legacy",
+            extra=("--server-request-mode", "invalid-id"),
+            client_capabilities={"roots": {}},
+        )
+        issue = finding(report, "JSONRPC_INVALID_REQUEST")
+        self.assertEqual(issue.status, "FAIL")
+        self.assertTrue(issue.evidence)
+        self.assertTrue(
+            any(
+                event.get("classification") == "invalid_server_request"
+                for event in recorder.events
+            )
+        )
+        self.assertTrue(
+            any(
+                event.get("direction") == "client_to_server"
+                and isinstance(event.get("payload"), dict)
+                and event["payload"].get("error", {}).get("code") == -32600
+                for event in recorder.events
+            )
+        )
+
+    def test_2025_03_batch_receive_and_grouped_server_responses_are_observed(self):
+        report, recorder = self.run_stdio(
+            "stdio-batch-server-request",
+            version="2025-03-26",
+            client_capabilities={"roots": {}},
+        )
+        self.assertEqual(finding(report, "JSONRPC_BATCH_SUPPORT").status, "PASS")
+        self.assertEqual(finding(report, "CLIENT_REQUEST_PING").status, "PASS")
+        self.assertEqual(finding(report, "CLIENT_REQUEST_ROOTS_LIST").status, "WARN")
+        self.assertTrue(
+            any(
+                event.get("direction") == "client_to_server"
+                and event.get("classification") == "batch"
+                for event in recorder.events
+            )
+        )
+
+    def test_2025_06_rejects_incoming_batch(self):
+        report, _ = self.run_stdio(
+            "stdio-batch-server-request",
+            version="2025-06-18",
+            client_capabilities={"roots": {}},
+            timeout=0.25,
+        )
+        self.assertEqual(finding(report, "JSONRPC_BATCH_SUPPORT").status, "FAIL")
 
     def test_notification_response_is_a_jsonrpc_violation(self):
         report, _ = self.run_stdio("stdio-notification-response")
@@ -198,7 +343,97 @@ class CompatibilityChecksStdioTests(unittest.TestCase):
             extra=("--tool-schema-mode", "bad-header"),
         )
         self.assertEqual(
-            finding(modern_header, "TOOL_SCHEMA_PORTABILITY").status, "FAIL"
+            finding(modern_header, "TOOL_SCHEMA_PORTABILITY").status, "WARN"
+        )
+
+        missing_type, _ = self.run_stdio(
+            "stdio-good-legacy", extra=("--tool-schema-mode", "missing-type")
+        )
+        self.assertEqual(
+            finding(missing_type, "TOOL_SCHEMA_INPUT_OBJECT").status, "FAIL"
+        )
+
+    def test_paginated_schema_evidence_points_to_the_faulting_page(self):
+        report, recorder = self.run_stdio(
+            "stdio-pagination",
+            extra=("--tool-schema-mode", "page-two-missing-input"),
+        )
+        issue = finding(report, "TOOL_SCHEMA_INPUT_PRESENT")
+        second_page = next(
+            event
+            for event in recorder.events
+            if event.get("direction") == "server_to_client"
+            and isinstance(event.get("payload"), dict)
+            and event["payload"].get("result", {}).get("tools", [{}])[0].get("name")
+            == "fixture_page_two"
+        )
+        self.assertEqual(issue.evidence[0].event, f"event:{second_page['seq']}")
+        self.assertEqual(issue.evidence[0].pointer, "/result/tools/0/inputSchema")
+
+        duplicate, _ = self.run_stdio(
+            "stdio-pagination",
+            extra=("--tool-schema-mode", "cross-page-duplicate"),
+        )
+        duplicate_issue = finding(duplicate, "TOOL_NAME_UNIQUE")
+        self.assertEqual(duplicate_issue.status, "WARN")
+        self.assertEqual(duplicate_issue.evidence[0].pointer, "/result/tools/0/name")
+
+    def test_modern_ttl_accepts_finite_numbers_and_rejects_negative_values(self):
+        valid, _ = self.run_stdio(
+            "stdio-good-modern",
+            version=MODERN,
+            extra=("--modern-ttl-mode", "float"),
+        )
+        self.assertEqual(valid.exit_code, 0)
+
+        invalid, _ = self.run_stdio(
+            "stdio-good-modern",
+            version=MODERN,
+            extra=("--modern-ttl-mode", "negative"),
+        )
+        self.assertEqual(finding(invalid, "JSONRPC_RESPONSE_SHAPE").status, "FAIL")
+
+    def test_modern_unsolicited_notifications_are_normatively_rejected(self):
+        cases = {
+            "logging": "CAPABILITY_LOGGING",
+            "progress": "JSONRPC_PROGRESS_TOKEN",
+            "tools": "CAPABILITY_TOOLS_LIST",
+            "resources": "CAPABILITY_RESOURCES_LIST",
+            "prompts": "CAPABILITY_PROMPTS_LIST",
+            "resource-updated": "CAPABILITY_RESOURCES_LIST",
+        }
+        for mode, code in cases.items():
+            with self.subTest(mode=mode):
+                report, _ = self.run_stdio(
+                    "stdio-good-modern",
+                    version=MODERN,
+                    extra=("--notification-mode", mode),
+                )
+                self.assertEqual(finding(report, code).status, "FAIL")
+
+    def test_modern_forbidden_server_request_is_not_answered(self):
+        report, recorder = self.run_stdio(
+            "stdio-good-modern",
+            version=MODERN,
+            extra=("--server-request-mode", "modern-forbidden"),
+        )
+        self.assertEqual(
+            finding(report, "CLIENT_REQUEST_UNSUPPORTED").status, "FAIL"
+        )
+        self.assertTrue(
+            any(
+                event.get("classification") == "forbidden_server_request"
+                for event in recorder.events
+            )
+        )
+        self.assertFalse(
+            any(
+                event.get("direction") == "client_to_server"
+                and event.get("classification") == "response"
+                and isinstance(event.get("payload"), dict)
+                and event["payload"].get("id") == "fixture-roots-request"
+                for event in recorder.events
+            )
         )
 
 
@@ -282,6 +517,23 @@ class CompatibilityChecksHttpTests(unittest.TestCase):
         self.assertEqual(report.exit_code, 3)
         self.assertIn("TRANSPORT_HTTP_TIMEOUT", [error.code for error in report.errors])
         self.assertEqual(finding(report, "HTTP_TIMEOUT").status, "FAIL")
+
+    def test_http_notification_may_be_rejected_with_idless_4xx_error(self):
+        report, _, _ = self.run_http("http-notification-reject")
+        self.assertEqual(
+            finding(report, "JSONRPC_NOTIFICATION_NO_RESPONSE").status, "PASS"
+        )
+        self.assertEqual(finding(report, "HTTP_STATUS").status, "PASS")
+        self.assertEqual(report.exit_code, 0)
+
+    def test_http_wrong_id_and_wrong_then_correct_are_protocol_failures(self):
+        wrong, _, _ = self.run_http("http-wrong-id")
+        self.assertEqual(finding(wrong, "JSONRPC_RESPONSE_ID").status, "FAIL")
+        self.assertFalse(wrong.errors)
+
+        mixed, _, _ = self.run_http("http-wrong-then-correct")
+        self.assertEqual(finding(mixed, "JSONRPC_RESPONSE_ID").status, "FAIL")
+        self.assertFalse(mixed.errors)
 
 
 if __name__ == "__main__":

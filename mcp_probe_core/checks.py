@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .errors import ConfigurationError, ProbeTimeout, ProcessExited, TransportError
-from .protocol import make_notification, response_error_code
+from .protocol import make_notification, profile_for, response_error_code
 from .report import (
     FINDING_CODE_CATEGORIES,
     CompatibilityReport,
@@ -30,6 +30,85 @@ from .transcript import EventRecorder
 
 _SEVERITY = {"SKIP": 0, "PASS": 1, "WARN": 2, "FAIL": 3}
 MAX_CHECK_PAGES = 1_000
+_INVALID_STDIO_CLASSES = {
+    "invalid",
+    "invalid_json",
+    "invalid_utf8",
+    "message_too_large",
+    "blank_line",
+    "missing_delimiter",
+    "invalid_batch",
+}
+
+
+def _typed_rpc_key(value: Any) -> tuple[str, str | int] | None:
+    if type(value) is int:
+        return ("int", value)
+    if isinstance(value, str):
+        return ("str", value)
+    return None
+
+
+def _finite_nonnegative_json_number(value: Any) -> bool:
+    return (
+        type(value) in {int, float}
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
+_CAPABILITY_BOOLEAN_FLAGS: dict[str, tuple[str, ...]] = {
+    "tools": ("listChanged",),
+    "resources": ("subscribe", "listChanged"),
+    "prompts": ("listChanged",),
+}
+_KNOWN_CAPABILITY_DESCRIPTORS = frozenset(
+    {*_CAPABILITY_BOOLEAN_FLAGS, "logging", "completions", "experimental", "tasks"}
+)
+
+_LIST_NOTIFICATION_CAPABILITIES: dict[str, tuple[str, str]] = {
+    "notifications/tools/list_changed": ("tools", "CAPABILITY_TOOLS_LIST"),
+    "notifications/resources/list_changed": (
+        "resources",
+        "CAPABILITY_RESOURCES_LIST",
+    ),
+    "notifications/resources/updated": (
+        "resources",
+        "CAPABILITY_RESOURCES_LIST",
+    ),
+    "notifications/prompts/list_changed": ("prompts", "CAPABILITY_PROMPTS_LIST"),
+}
+
+
+def _capability_shape_issues(capabilities: Any) -> list[dict[str, Any]]:
+    if not isinstance(capabilities, dict):
+        return [{"path": "/capabilities", "expected": "object", "actual": capabilities}]
+    issues: list[dict[str, Any]] = []
+    for name, descriptor in capabilities.items():
+        if name not in _KNOWN_CAPABILITY_DESCRIPTORS:
+            continue
+        descriptor_path = f"/capabilities/{name}"
+        if not isinstance(descriptor, dict):
+            issues.append(
+                {
+                    "path": descriptor_path,
+                    "expected": "object",
+                    "actual": descriptor,
+                }
+            )
+            continue
+        for flag in _CAPABILITY_BOOLEAN_FLAGS.get(name, ()):
+            if flag in descriptor and not isinstance(descriptor[flag], bool):
+                issues.append(
+                    {
+                        "path": f"{descriptor_path}/{flag}",
+                        "expected": "boolean",
+                        "actual": descriptor[flag],
+                    }
+                )
+    return issues
+
+
 _PRIMITIVE_CHECKS: dict[str, tuple[str, str, str]] = {
     "tools": ("CAPABILITY_TOOLS_LIST", "tools", "tools/list"),
     "resources": ("CAPABILITY_RESOURCES_LIST", "resources", "resources/list"),
@@ -118,10 +197,16 @@ class _CheckRun:
         self.responses: list[InboundMessage] = []
         self.observed_requests: list[InboundMessage] = []
         self.pagination: dict[str, PaginationResult] = {}
+        # Matrix runs deliberately share a recorder so the saved transcript has
+        # one monotonic sequence. Findings, however, must only inspect evidence
+        # produced by this run; otherwise an earlier version can contaminate a
+        # later version's compatibility result.
+        self._event_start = len(self.recorder.events)
         self._started_at = dt.datetime.now(dt.UTC).isoformat(timespec="milliseconds")
         self._started_mono = time.monotonic()
         self._operation_exception: Exception | None = None
         self._cleanup: CleanupResult | int | None = None
+        self._probe_notification_seq: int | None = None
 
     def execute(self) -> CompatibilityReport:
         try:
@@ -133,7 +218,19 @@ class _CheckRun:
                 if self._operation_exception is None:
                     self._check_unknown_method()
                 if self._operation_exception is None:
-                    self._check_notification_no_response()
+                    if self.session.profile.modern:
+                        self._add(
+                            "JSONRPC_NOTIFICATION_NO_RESPONSE",
+                            "SKIP",
+                            "The modern safe suite did not synthesize a client notification.",
+                            details=(
+                                "The 2026-07-28 core defines no client-to-server "
+                                "notification exercised by this non-mutating suite; use a "
+                                "scenario for extension or malformed-notification behavior."
+                            ),
+                        )
+                    else:
+                        self._check_notification_no_response()
         except (ConfigurationError, TransportError) as exc:
             self._operation_exception = exc
             self._diagnose_exception(exc)
@@ -158,8 +255,10 @@ class _CheckRun:
                     self._diagnose_close_exception(exc)
 
         self._collect_server_request_findings()
+        self._add_notification_findings()
         self._validate_response_envelopes()
         self._add_transport_findings()
+        self._add_batch_findings()
         self._add(
             "SAFETY_ACTIVE_TOOL_OPT_IN",
             "PASS",
@@ -217,9 +316,14 @@ class _CheckRun:
             elif success:
                 self._add(
                     "LIFECYCLE_INITIALIZED",
-                    "SKIP",
-                    "Initialized notification was deliberately omitted.",
-                    details="SessionConfig.send_initialized is false for this protocol experiment.",
+                    "FAIL",
+                    "The required initialized notification was deliberately omitted.",
+                    details=(
+                        "MCP Probe preserved the requested lifecycle mutation and reports "
+                        "its normative compatibility consequence."
+                    ),
+                    expected="notifications/initialized after initialize result",
+                    actual="omitted",
                     evidence=evidence,
                 )
 
@@ -241,7 +345,7 @@ class _CheckRun:
             evidence=evidence,
         )
 
-        if not success or result is None:
+        if result is None:
             self._add(
                 "NEGOTIATION_PROTOCOL_VERSION",
                 "FAIL",
@@ -271,11 +375,9 @@ class _CheckRun:
                 evidence=(self._pointer(response, "/result/supportedVersions"),),
             )
             required = {
-                "resultType": isinstance(result.get("resultType"), str)
-                and bool(result.get("resultType")),
-                "ttlMs": type(result.get("ttlMs")) is int and result["ttlMs"] >= 0,
-                "cacheScope": isinstance(result.get("cacheScope"), str)
-                and bool(result.get("cacheScope")),
+                "resultType": result.get("resultType") == "complete",
+                "ttlMs": _finite_nonnegative_json_number(result.get("ttlMs")),
+                "cacheScope": result.get("cacheScope") in {"public", "private"},
             }
             if not all(required.values()):
                 self._add(
@@ -291,12 +393,30 @@ class _CheckRun:
             if not isinstance(selected, str) or not selected:
                 status = "FAIL"
                 summary = "initialize.result.protocolVersion is missing or not a string."
-            elif selected == self.session.requested_version:
+            else:
+                try:
+                    selected_profile = profile_for(selected)
+                except ConfigurationError:
+                    selected_profile = None
+                transport_compatible = not (
+                    isinstance(self.session.transport, HttpTransport)
+                    and selected_profile is not None
+                    and not selected_profile.streamable_http
+                )
+                compatible = (
+                    selected_profile is not None
+                    and not selected_profile.modern
+                    and transport_compatible
+                )
+            if isinstance(selected, str) and selected == self.session.requested_version:
                 status = "PASS"
                 summary = "The server negotiated the requested protocol version."
-            else:
+            elif isinstance(selected, str) and compatible:
                 status = "WARN"
                 summary = "The server selected a different dated protocol version."
+            else:
+                status = "FAIL"
+                summary = "The server selected an unsupported or lifecycle-incompatible version."
             self._add(
                 "NEGOTIATION_PROTOCOL_VERSION",
                 status,
@@ -307,14 +427,15 @@ class _CheckRun:
             )
 
         capabilities = result.get("capabilities")
+        capability_issues = _capability_shape_issues(capabilities)
         self._add(
             "NEGOTIATION_CAPABILITIES",
-            "PASS" if isinstance(capabilities, dict) else "FAIL",
-            "Server capabilities have the required object shape."
-            if isinstance(capabilities, dict)
-            else "Server capabilities are missing or not an object.",
-            expected="object",
-            actual=capabilities,
+            "PASS" if not capability_issues else "FAIL",
+            "Server capabilities and their known descriptors have the required shapes."
+            if not capability_issues
+            else "Server capabilities contain a malformed descriptor or flag.",
+            expected="object descriptors with boolean capability flags",
+            actual=capability_issues or capabilities,
             evidence=(self._pointer(response, "/result/capabilities"),),
         )
         server_info = self.session.server_info
@@ -595,28 +716,73 @@ class _CheckRun:
                     "PASS",
                     summaries[code],
                     basis="heuristic" if code == "TOOL_SCHEMA_PORTABILITY" else "normative",
-                    evidence=(
-                        self._pointer(response, "/result/tools") if response else None
-                    ,),
+                    evidence=tuple(
+                        self._pointer(item, "/result/tools")
+                        for item in pagination.responses
+                    ),
                 )
                 continue
             status = max((issue.status for issue in group), key=_SEVERITY.__getitem__)
             basis = "heuristic" if all(issue.basis == "heuristic" for issue in group) else "normative"
-            if code == "TOOL_SCHEMA_PORTABILITY" and not self.session.profile.modern:
+            if code == "TOOL_SCHEMA_PORTABILITY" and not (
+                self.session.profile.modern
+                and isinstance(self.session.transport, HttpTransport)
+            ):
                 # x-mcp-header is defined by the 2026-07-28 HTTP binding.  On
                 # older profiles it is useful portability evidence, not a
                 # normative failure for that dated protocol.
                 status = "WARN"
                 basis = "heuristic"
-            pointer = "/result" + group[0].path
             self._add(
                 code,
                 status,
                 group[0].message if len(group) == 1 else f"{len(group)} related tool schema issues were found.",
                 basis=basis,
                 actual=[issue.to_dict() for issue in group],
-                evidence=(self._pointer(response, pointer),) if response else (),
+                evidence=self._schema_issue_evidence(group, pagination),
             )
+
+    def _schema_issue_evidence(
+        self, issues: Iterable[SchemaIssue], pagination: PaginationResult
+    ) -> tuple[EvidenceRef, ...]:
+        """Map flattened tool indexes back to their actual page and pointer."""
+
+        spans: list[tuple[int, int, InboundMessage]] = []
+        offset = 0
+        for response in pagination.responses:
+            payload = response.payload
+            result = payload.get("result") if isinstance(payload, dict) else None
+            page_tools = result.get("tools") if isinstance(result, dict) else None
+            count = len(page_tools) if isinstance(page_tools, list) else 0
+            spans.append((offset, offset + count, response))
+            offset += count
+
+        refs: list[EvidenceRef] = []
+        seen: set[tuple[str, str]] = set()
+        for issue in issues:
+            parts = issue.path.split("/")
+            if len(parts) < 3 or parts[1] != "tools" or not parts[2].isdigit():
+                if pagination.responses:
+                    ref = self._pointer(pagination.responses[0], "/result/tools")
+                    key = (ref.event, ref.pointer)
+                    if key not in seen:
+                        seen.add(key)
+                        refs.append(ref)
+                continue
+            flattened_index = int(parts[2])
+            suffix = "/".join(parts[3:])
+            for start, end, page in spans:
+                if start <= flattened_index < end:
+                    pointer = f"/result/tools/{flattened_index - start}"
+                    if suffix:
+                        pointer += f"/{suffix}"
+                    ref = self._pointer(page, pointer)
+                    key = (ref.event, ref.pointer)
+                    if key not in seen:
+                        seen.add(key)
+                        refs.append(ref)
+                    break
+        return tuple(refs)
 
     @staticmethod
     def _schema_report_code(issue_code: str) -> str:
@@ -674,11 +840,37 @@ class _CheckRun:
             if isinstance(self.session.transport, HttpTransport):
                 exchange = self.session.transport.send_message(message, self.options.timeout)
                 responses = [item for item in exchange.messages if item.classification == "response"]
-                good = not responses and 200 <= exchange.status < 300
+                idless_errors = [
+                    item
+                    for item in responses
+                    if isinstance(item.payload, dict)
+                    and "id" not in item.payload
+                    and isinstance(item.payload.get("error"), dict)
+                ]
+                accepted = (
+                    exchange.status == 202
+                    and exchange.body == ""
+                    and not responses
+                )
+                rejected = (
+                    400 <= exchange.status < 500
+                    and len(idless_errors) == len(responses)
+                    and (
+                        exchange.body == ""
+                        or (bool(responses) and not exchange.parse_issues)
+                    )
+                )
+                good = accepted or rejected
                 evidence = tuple(item.evidence for item in responses) or self._last_evidence()
-                actual: Any = {"httpStatus": exchange.status, "responseCount": len(responses)}
+                actual: Any = {
+                    "httpStatus": exchange.status,
+                    "responseCount": len(responses),
+                    "idlessErrorCount": len(idless_errors),
+                    "emptyBody": exchange.body == "",
+                }
             else:
                 sent = self.session.transport.send_message(message)
+                self._probe_notification_seq = int(sent.partition(":")[2])
                 responses = []
                 deadline = time.monotonic() + self.options.notification_observation_window
                 while time.monotonic() < deadline:
@@ -719,12 +911,171 @@ class _CheckRun:
             self._operation_exception = exc
             self._diagnose_exception(exc)
 
+    def _add_batch_findings(self) -> None:
+        batches = [
+            event
+            for event in self._events
+            if event.get("direction") == "server_to_client"
+            and event.get("classification") == "batch"
+        ]
+        invalid = [
+            event
+            for event in self._events
+            if event.get("direction") == "server_to_client"
+            and event.get("classification") == "invalid_batch"
+        ]
+        if invalid:
+            self._add(
+                "JSONRPC_BATCH_SUPPORT",
+                "FAIL",
+                "The server emitted a batch that is invalid for the selected protocol profile.",
+                expected=(
+                    "a bounded non-empty JSON-RPC batch"
+                    if self.session.profile.batch_receive_required
+                    else "individual JSON-RPC messages"
+                ),
+                actual={"invalidBatches": len(invalid)},
+                evidence=tuple(self._event_ref(event) for event in invalid),
+            )
+        elif batches:
+            self._add(
+                "JSONRPC_BATCH_SUPPORT",
+                "PASS" if self.session.profile.batch_receive_required else "FAIL",
+                "An incoming JSON-RPC batch was accepted by the 2025-03-26 receive path."
+                if self.session.profile.batch_receive_required
+                else "The server emitted a JSON-RPC batch in a profile that does not use batching.",
+                actual={"batches": len(batches)},
+                evidence=tuple(self._event_ref(event) for event in batches),
+            )
+        else:
+            self._add(
+                "JSONRPC_BATCH_SUPPORT",
+                "SKIP",
+                "JSON-RPC batch receive behavior was not exercised."
+                if self.session.profile.batch_receive_required
+                else "JSON-RPC batching is not part of this selected compatibility profile.",
+                details=(
+                    "A PASS is reported only when an incoming 2025-03-26 batch is observed."
+                    if self.session.profile.batch_receive_required
+                    else "Later MCP profiles exchange individual JSON-RPC messages."
+                ),
+            )
+
+    def _add_notification_findings(self) -> None:
+        outstanding: dict[tuple[str, str | int], dict[str, Any]] = {}
+        progress: list[tuple[dict[str, Any], bool]] = []
+        logging: list[tuple[dict[str, Any], bool]] = []
+        changes: list[tuple[dict[str, Any], str, str, bool]] = []
+
+        for event in self._events:
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            direction = event.get("direction")
+            classification = event.get("classification")
+            if direction == "client_to_server" and classification == "request":
+                key = _typed_rpc_key(payload.get("id"))
+                if key is not None:
+                    outstanding[key] = payload
+                continue
+            if direction == "server_to_client" and classification == "response":
+                key = _typed_rpc_key(payload.get("id"))
+                if key is not None:
+                    outstanding.pop(key, None)
+                continue
+            if direction != "server_to_client" or classification != "notification":
+                continue
+
+            method = payload.get("method")
+            params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+            active_meta = [
+                request.get("params", {}).get("_meta", {})
+                for request in outstanding.values()
+                if isinstance(request.get("params"), dict)
+                and isinstance(request["params"].get("_meta"), dict)
+            ]
+            if method == "notifications/progress":
+                token = params.get("progressToken")
+                token_key = _typed_rpc_key(token)
+                allowed = token_key is not None and any(
+                    token_key in {
+                        _typed_rpc_key(meta.get("progressToken")),
+                        _typed_rpc_key(meta.get("io.modelcontextprotocol/progressToken")),
+                    }
+                    for meta in active_meta
+                )
+                progress.append((event, allowed))
+            elif method == "notifications/message" and self.session.profile.modern:
+                allowed = any(
+                    "io.modelcontextprotocol/logLevel" in meta for meta in active_meta
+                )
+                logging.append((event, allowed))
+            elif method in _LIST_NOTIFICATION_CAPABILITIES:
+                capability, code = _LIST_NOTIFICATION_CAPABILITIES[method]
+                descriptor = self.session.capabilities.get(capability)
+                if self.session.profile.modern:
+                    # The safe suite never establishes subscriptions/listen.
+                    allowed = False
+                elif method == "notifications/resources/updated":
+                    allowed = isinstance(descriptor, dict) and descriptor.get("subscribe") is True
+                else:
+                    allowed = isinstance(descriptor, dict) and descriptor.get("listChanged") is True
+                changes.append((event, capability, code, allowed))
+
+        if progress:
+            bad = [event for event, allowed in progress if not allowed]
+            self._add(
+                "JSONRPC_PROGRESS_TOKEN",
+                "FAIL" if bad else "PASS",
+                "A progress notification did not match an active request token."
+                if bad
+                else "Progress notifications matched active request tokens.",
+                evidence=tuple(self._event_ref(event) for event in (bad or [item[0] for item in progress])),
+            )
+        else:
+            self._add(
+                "JSONRPC_PROGRESS_TOKEN",
+                "SKIP",
+                "No progress notification was observed.",
+                details="The safe suite did not request progress for any operation.",
+            )
+
+        if logging:
+            bad = [event for event, allowed in logging if not allowed]
+            self._add(
+                "CAPABILITY_LOGGING",
+                "FAIL" if bad else "PASS",
+                "A modern logging notification was sent without a request-scoped logLevel."
+                if bad
+                else "Modern logging notifications matched request-scoped log levels.",
+                evidence=tuple(self._event_ref(event) for event in (bad or [item[0] for item in logging])),
+            )
+
+        for event, capability, code, allowed in changes:
+            self._add(
+                code,
+                "PASS" if allowed else "FAIL",
+                f"The {capability} change notification matched negotiated behavior."
+                if allowed
+                else (
+                    f"The modern {capability} change notification had no active subscription."
+                    if self.session.profile.modern
+                    else f"The {capability} change notification was not advertised."
+                ),
+                evidence=(self._event_ref(event),),
+            )
+
     def _collect_server_request_findings(self) -> None:
         requests = list(self.observed_requests)
         if isinstance(self.session.transport, StdioTransport):
             requests.extend(self.session.transport.observed_server_requests())
         else:
             requests.extend(self._http_server_requests())
+
+        deduplicated: dict[str, InboundMessage] = {}
+        for request in requests:
+            deduplicated.setdefault(request.evidence, request)
+        requests = list(deduplicated.values())
 
         if not requests:
             self._add(
@@ -752,46 +1103,286 @@ class _CheckRun:
         unsupported = [
             item for item in requests if self._method(item) not in {"ping", "roots/list"}
         ]
+        invalid = [
+            item
+            for item in requests
+            if not isinstance(item.payload, dict)
+            or _typed_rpc_key(item.payload.get("id")) is None
+            or not isinstance(item.payload.get("method"), str)
+        ]
+        if invalid:
+            outcomes = [self._server_request_outcome(item) for item in invalid]
+            rejected = all(
+                outcome["valid"]
+                and response_error_code(outcome["payload"]) == -32600
+                and not outcome["failures"]
+                for outcome in outcomes
+            )
+            self._add(
+                "JSONRPC_INVALID_REQUEST",
+                "FAIL",
+                "The server emitted a malformed request; MCP Probe rejected it with -32600."
+                if rejected
+                else "The server emitted a malformed request and the client rejection was incomplete.",
+                expected={"serverRequest": "valid JSON-RPC", "clientErrorCode": -32600},
+                actual=outcomes,
+                evidence=tuple(
+                    ref
+                    for item, outcome in zip(invalid, outcomes)
+                    for ref in (item.evidence, *outcome["evidence"])
+                ),
+            )
         if ping_requests:
+            outcomes = [self._server_request_outcome(item) for item in ping_requests]
+            handled = all(
+                outcome["valid"]
+                and isinstance(outcome["payload"].get("result"), dict)
+                and not outcome["failures"]
+                for outcome in outcomes
+            )
+            good = handled and not self.session.profile.modern
             self._add(
                 "CLIENT_REQUEST_PING",
-                "PASS" if not self.session.profile.modern else "FAIL",
+                "PASS" if good else "FAIL",
                 "Legacy ping requests were handled explicitly."
-                if not self.session.profile.modern
-                else "A modern server sent a forbidden server-to-client ping request.",
-                evidence=tuple(item.evidence for item in ping_requests),
+                if good
+                else (
+                    "A modern server sent a forbidden server-to-client ping request."
+                    if self.session.profile.modern
+                    else "A legacy ping request did not receive a valid successful response."
+                ),
+                actual=outcomes,
+                evidence=tuple(
+                    ref
+                    for item, outcome in zip(ping_requests, outcomes)
+                    for ref in (item.evidence, *outcome["evidence"])
+                ),
             )
         if roots_requests:
             roots_advertised = "roots" in self.session.config.client_capabilities
-            good = roots_advertised and not self.session.profile.modern
+            early = [
+                item for item in roots_requests if self._server_request_marker(item, "pre_initialized_server_request")
+            ]
+            outcomes = [self._server_request_outcome(item) for item in roots_requests]
+            if early:
+                early_outcomes = [self._server_request_outcome(item) for item in early]
+                rejected = all(
+                    outcome["valid"]
+                    and response_error_code(outcome["payload"]) == -32002
+                    and not outcome["failures"]
+                    for outcome in early_outcomes
+                )
+                self._add(
+                    "LIFECYCLE_ORDERING",
+                    "WARN" if rejected else "FAIL",
+                    "A roots/list request arrived before initialization and was explicitly rejected."
+                    if rejected
+                    else "A pre-initialization roots/list request was not rejected with -32002.",
+                    expected={"errorCode": -32002},
+                    actual=early_outcomes,
+                    evidence=tuple(
+                        ref
+                        for item, outcome in zip(early, early_outcomes)
+                        for ref in (item.evidence, *outcome["evidence"])
+                    ),
+                )
+
+            normal_pairs = [
+                (item, outcome)
+                for item, outcome in zip(roots_requests, outcomes)
+                if item not in early
+            ]
+            if self.session.profile.modern:
+                good = False
+            elif normal_pairs and roots_advertised:
+                good = all(
+                    outcome["valid"]
+                    and isinstance(outcome["payload"].get("result"), dict)
+                    and isinstance(outcome["payload"]["result"].get("roots"), list)
+                    and not outcome["failures"]
+                    for _, outcome in normal_pairs
+                )
+            elif normal_pairs:
+                good = all(
+                    outcome["valid"]
+                    and response_error_code(outcome["payload"]) == -32601
+                    and not outcome["failures"]
+                    for _, outcome in normal_pairs
+                )
+            else:
+                good = bool(early) and all(
+                    outcome["valid"]
+                    and response_error_code(outcome["payload"]) == -32002
+                    and not outcome["failures"]
+                    for outcome in outcomes
+                )
+            roots_status = "PASS" if good and not early else ("WARN" if good else "FAIL")
             self._add(
                 "CLIENT_REQUEST_ROOTS_LIST",
-                "PASS" if good else "FAIL",
+                roots_status,
                 "roots/list matched the advertised legacy client capability."
-                if good
-                else "The server requested roots/list without an applicable client capability.",
-                expected={"clientCapabilities.roots": True, "era": "legacy"},
-                actual={"advertised": roots_advertised, "era": self.session.profile.era},
-                evidence=tuple(item.evidence for item in roots_requests),
+                if roots_status == "PASS"
+                else (
+                    "The pre-initialization roots/list request was rejected before normal roots handling."
+                    if roots_status == "WARN"
+                    else "roots/list did not receive the response required by lifecycle and capability state."
+                ),
+                expected={"clientCapabilities.roots": True, "era": "legacy", "response": "result or explicit error"},
+                actual={"advertised": roots_advertised, "era": self.session.profile.era, "outcomes": outcomes},
+                evidence=tuple(
+                    ref
+                    for item, outcome in zip(roots_requests, outcomes)
+                    for ref in (item.evidence, *outcome["evidence"])
+                ),
             )
+            capability_good = bool(normal_pairs) and roots_advertised and roots_status == "PASS"
             self._add(
                 "CAPABILITY_ROOTS",
-                "PASS" if good else "FAIL",
+                "PASS" if capability_good else ("SKIP" if early and not normal_pairs else "FAIL"),
                 "Observed roots behavior is capability-consistent."
-                if good
-                else "Observed roots behavior contradicts capability negotiation.",
+                if capability_good
+                else (
+                    "Normal roots capability behavior was not reached before initialization."
+                    if early and not normal_pairs
+                    else "Observed roots behavior contradicts capability negotiation."
+                ),
+                details=(
+                    "The request was rejected during lifecycle establishment, before roots could be served."
+                    if early and not normal_pairs
+                    else None
+                ),
                 evidence=tuple(item.evidence for item in roots_requests),
             )
         if unsupported or (self.session.profile.modern and requests):
             relevant = requests if self.session.profile.modern else unsupported
+            outcomes = [self._server_request_outcome(item) for item in relevant]
+            handled = (
+                not self.session.profile.modern
+                and not invalid
+                and all(
+                    outcome["valid"]
+                    and response_error_code(outcome["payload"]) == -32601
+                    and not outcome["failures"]
+                    for outcome in outcomes
+                )
+            )
             self._add(
                 "CLIENT_REQUEST_UNSUPPORTED",
-                "FAIL",
-                "The server sent an unsupported server-to-client request.",
-                expected="no request without a negotiated client capability",
-                actual=[item.payload for item in relevant],
-                evidence=tuple(item.evidence for item in relevant),
+                "PASS" if handled else "FAIL",
+                "Unsupported legacy server requests received explicit method-not-found errors."
+                if handled
+                else (
+                    "A modern server sent a forbidden server-to-client request."
+                    if self.session.profile.modern
+                    else "An unsupported or malformed server request was not rejected correctly."
+                ),
+                expected=("no server requests or client responses" if self.session.profile.modern else {"errorCode": -32601}),
+                actual=outcomes,
+                evidence=tuple(
+                    ref
+                    for item, outcome in zip(relevant, outcomes)
+                    for ref in (item.evidence, *outcome["evidence"])
+                ),
             )
+
+    def _server_request_marker(
+        self, request: InboundMessage, classification: str
+    ) -> dict[str, Any] | None:
+        request_key = _typed_rpc_key(
+            request.payload.get("id") if isinstance(request.payload, dict) else None
+        )
+        for event in self._events:
+            if event.get("classification") != classification:
+                continue
+            source = event.get("sourceEvidence")
+            if source == request.evidence or (
+                isinstance(source, list) and request.evidence in source
+            ):
+                return event
+            if request_key is not None and _typed_rpc_key(event.get("requestId")) == request_key:
+                return event
+            if request_key is not None and isinstance(event.get("requestIds"), list):
+                if any(_typed_rpc_key(value) == request_key for value in event["requestIds"]):
+                    return event
+        return None
+
+    def _server_request_outcome(self, request: InboundMessage) -> dict[str, Any]:
+        request_id = request.payload.get("id") if isinstance(request.payload, dict) else None
+        request_key = _typed_rpc_key(request_id)
+        invalid_request = self._server_request_marker(request, "invalid_server_request")
+        request_seq = int(request.evidence.partition(":")[2])
+        response_candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for event in self._events:
+            if event.get("seq", 0) <= request_seq or event.get("direction") != "client_to_server":
+                continue
+            payloads: list[Any]
+            if event.get("classification") == "response":
+                payloads = [event.get("payload")]
+            elif event.get("classification") == "batch" and isinstance(event.get("payload"), list):
+                payloads = event["payload"]
+            else:
+                continue
+            for payload_candidate in payloads:
+                if (
+                    isinstance(payload_candidate, dict)
+                    and (
+                        (
+                            request_key is not None
+                            and _typed_rpc_key(payload_candidate.get("id")) == request_key
+                        )
+                        or (
+                            invalid_request is not None
+                            and request_key is None
+                            and payload_candidate.get("id") is None
+                        )
+                    )
+                    and (("result" in payload_candidate) ^ ("error" in payload_candidate))
+                ):
+                    response_candidates.append((event, payload_candidate))
+        success_marker = self._server_request_marker(request, "server_request_response")
+        failures = [
+            marker
+            for name in (
+                "server_request_handler_error",
+                "server_request_response_error",
+                "server_request_response_http_error",
+                "server_request_response_correlation_error",
+                "server_request_response_skipped",
+            )
+            if (marker := self._server_request_marker(request, name)) is not None
+        ]
+        payload = response_candidates[0][1] if response_candidates else None
+        valid = (
+            isinstance(payload, dict)
+            and payload.get("jsonrpc") == "2.0"
+            and (
+                (request_key is not None and _typed_rpc_key(payload.get("id")) == request_key)
+                or (
+                    invalid_request is not None
+                    and request_key is None
+                    and payload.get("id") is None
+                )
+            )
+            and (("result" in payload) ^ ("error" in payload))
+        )
+        http_status = success_marker.get("httpStatus") if success_marker else None
+        if type(http_status) is int and not 200 <= http_status < 300:
+            valid = False
+        evidence = list(
+            dict.fromkeys(self._event_ref(event) for event, _ in response_candidates)
+        )
+        if success_marker:
+            evidence.append(self._event_ref(success_marker))
+        evidence.extend(self._event_ref(event) for event in failures)
+        return {
+            "requestId": request_id,
+            "responseObserved": bool(response_candidates),
+            "payload": payload,
+            "httpStatus": http_status,
+            "valid": valid,
+            "failures": [event.get("classification") for event in failures],
+            "evidence": evidence,
+        }
 
     def _validate_response_envelopes(self) -> None:
         if not self.responses:
@@ -837,7 +1428,7 @@ class _CheckRun:
                 bad_shape.append(item)
             elif self.session.profile.modern:
                 result = payload["result"]
-                if not isinstance(result.get("resultType"), str) or not result["resultType"]:
+                if result.get("resultType") != "complete":
                     bad_shape.append(item)
         self._add(
             "JSONRPC_RESPONSE_SHAPE",
@@ -849,14 +1440,37 @@ class _CheckRun:
             actual=[item.payload for item in bad_shape] if bad_shape else {"responses": len(self.responses)},
             evidence=tuple(item.evidence for item in (bad_shape or self.responses)),
         )
+        unexpected_ids = self._response_id_anomalies()
         self._add(
             "JSONRPC_RESPONSE_ID",
-            "PASS",
-            "All responses used the request ID selected for correlation.",
+            "FAIL" if unexpected_ids else "PASS",
+            "The server emitted a response whose ID was not outstanding."
+            if unexpected_ids
+            else "All responses used the request ID selected for correlation.",
             expected="type-exact request ID",
-            actual={"correlatedResponses": len(self.responses)},
-            evidence=tuple(item.evidence for item in self.responses),
+            actual=[event.get("payload", {}).get("id") for event in unexpected_ids]
+            if unexpected_ids
+            else {"correlatedResponses": len(self.responses)},
+            evidence=tuple(self._event_ref(event) for event in unexpected_ids)
+            or tuple(item.evidence for item in self.responses),
         )
+        if self._probe_notification_seq is not None:
+            notification_responses = [
+                event
+                for event in unexpected_ids
+                if event.get("seq", 0) > self._probe_notification_seq
+            ]
+            if notification_responses:
+                self._add(
+                    "JSONRPC_NOTIFICATION_NO_RESPONSE",
+                    "FAIL",
+                    "The server incorrectly responded to a JSON-RPC notification.",
+                    expected={"responseCount": 0},
+                    actual={"responseCount": len(notification_responses)},
+                    evidence=tuple(
+                        self._event_ref(event) for event in notification_responses
+                    ),
+                )
 
     def _diagnose_exception(self, exc: Exception) -> None:
         if isinstance(exc, ConfigurationError):
@@ -871,7 +1485,7 @@ class _CheckRun:
             )
             return
 
-        events = self.recorder.events
+        events = self._events
         outgoing = next(
             (
                 event
@@ -891,7 +1505,10 @@ class _CheckRun:
         if outgoing is not None and responses:
             expected_id = outgoing.get("id")
             actual_ids = [event.get("id") for event in responses]
-            if expected_id not in actual_ids:
+            expected_key = _typed_rpc_key(expected_id)
+            if expected_key is not None and not any(
+                _typed_rpc_key(actual_id) == expected_key for actual_id in actual_ids
+            ):
                 self._add(
                     "JSONRPC_RESPONSE_ID",
                     "FAIL",
@@ -905,8 +1522,7 @@ class _CheckRun:
             event
             for event in events
             if event.get("direction") == "server_to_client"
-            and event.get("classification")
-            in {"invalid", "invalid_json", "invalid_utf8", "message_too_large", "invalid_body"}
+            and event.get("classification") in (_INVALID_STDIO_CLASSES | {"invalid_body"})
         ]
         invalid_rpc = [
             event
@@ -938,7 +1554,12 @@ class _CheckRun:
                     evidence=tuple(self._event_ref(event) for event in bad_version),
                 )
         parse_events = [event for event in events if event.get("classification") == "parse_issue"]
-        protocol_fault = bool(responses or invalid_events or parse_events)
+        unexpected_ids = [
+            event
+            for event in events
+            if event.get("classification") == "unexpected_response_id"
+        ]
+        protocol_fault = bool(responses or invalid_events or parse_events or unexpected_ids)
         if protocol_fault:
             return
 
@@ -1012,15 +1633,14 @@ class _CheckRun:
         )
 
     def _add_transport_findings(self) -> None:
-        events = self.recorder.events
+        events = self._events
         if isinstance(self.session.transport, StdioTransport):
             started = any(event.get("classification") == "process_start" for event in events)
             invalid = [
                 event
                 for event in events
                 if event.get("direction") == "server_to_client"
-                and event.get("classification")
-                in {"invalid", "invalid_json", "invalid_utf8", "message_too_large"}
+                and event.get("classification") in _INVALID_STDIO_CLASSES
             ]
             if not started:
                 self._add(
@@ -1075,13 +1695,40 @@ class _CheckRun:
                     actual=str(self._operation_exception),
                     evidence=self._last_evidence(),
                 )
-                if self.session.transport.returncode not in {None, 0}:
-                    self._add(
-                        "STDIO_CHILD_EXIT",
-                        "FAIL",
-                        "The stdio server exited with a non-zero status.",
-                        actual=self.session.transport.returncode,
-                        evidence=self._last_evidence(),
+            cleanup_returncode = (
+                self._cleanup.returncode
+                if isinstance(self._cleanup, CleanupResult)
+                else self.session.transport.returncode
+            )
+            child_exited_naturally = not isinstance(
+                self._cleanup, CleanupResult
+            ) or self._cleanup.graceful
+            if cleanup_returncode not in {None, 0} and child_exited_naturally:
+                cleanup_evidence = self._events_by_class("process_cleanup")
+                self._add(
+                    "STDIO_CHILD_EXIT",
+                    "FAIL",
+                    "The stdio server exited with a non-zero status.",
+                    basis="operational",
+                    expected=0,
+                    actual=cleanup_returncode,
+                    evidence=cleanup_evidence or self._last_evidence(),
+                )
+                if not any(
+                    error.code == "TRANSPORT_STDIO_CHILD_EXIT"
+                    for error in self.errors
+                ):
+                    self.errors.append(
+                        RunError(
+                            code="TRANSPORT_STDIO_CHILD_EXIT",
+                            kind="transport",
+                            summary="The stdio server exited with a non-zero status.",
+                            details=(
+                                f"The child returned exit status {cleanup_returncode} "
+                                "during compatibility-run cleanup."
+                            ),
+                            evidence=cleanup_evidence or self._last_evidence(),
+                        )
                     )
             if isinstance(self._cleanup, CleanupResult):
                 if self._cleanup.killed:
@@ -1163,7 +1810,10 @@ class _CheckRun:
             "One or more HTTP statuses did not match the protocol interaction."
             if bad_status
             else "Observed HTTP statuses matched the supported Streamable HTTP subset.",
-            expected="successful 2xx, or modern method-not-found 404",
+            expected=(
+                "successful 2xx, an HTTP notification rejection, "
+                "or modern method-not-found 404"
+            ),
             actual=[event.get("httpStatus") for event in bad_status]
             if bad_status
             else [event.get("httpStatus") for _, event in exchanges],
@@ -1176,12 +1826,10 @@ class _CheckRun:
             if not event.get("byteLength"):
                 continue
             content_type = self._header(event.get("headers", {}), "content-type") or ""
-            if "text/event-stream" in content_type.lower():
+            media_type = content_type.partition(";")[0].strip().lower()
+            if media_type == "text/event-stream":
                 sse_events.append(event)
-            if not any(
-                allowed in content_type.lower()
-                for allowed in ("application/json", "text/event-stream")
-            ):
+            if media_type not in {"application/json", "text/event-stream"}:
                 bad_content.append(event)
         self._add(
             "HTTP_CONTENT_TYPE",
@@ -1266,13 +1914,20 @@ class _CheckRun:
             )
 
         if isinstance(self._cleanup, int):
+            termination_ok = 200 <= self._cleanup < 300 or self._cleanup == 405
             self._add(
                 "HTTP_SESSION_TERMINATION",
-                "PASS" if 200 <= self._cleanup < 300 else "FAIL",
-                "The assigned HTTP session was terminated."
-                if 200 <= self._cleanup < 300
-                else "HTTP session termination returned an error status.",
-                expected="2xx",
+                "PASS" if termination_ok else "FAIL",
+                (
+                    "The assigned HTTP session was terminated."
+                    if 200 <= self._cleanup < 300
+                    else (
+                        "The server explicitly does not permit client session termination."
+                        if self._cleanup == 405
+                        else "HTTP session termination returned an error status."
+                    )
+                ),
+                expected="2xx or 405",
                 actual=self._cleanup,
                 evidence=self._events_by_class("session_terminated"),
             )
@@ -1304,7 +1959,7 @@ class _CheckRun:
     def _check_http_request_headers(self) -> None:
         requests = [
             event
-            for event in self.recorder.events
+            for event in self._events
             if event.get("direction") == "client_to_server"
             and event.get("transport") == "http"
             and event.get("classification") == "request"
@@ -1347,29 +2002,177 @@ class _CheckRun:
             return False
         if 200 <= status < 300:
             return True
+        action_index = self._previous_http_action_index(event_index)
+        if (
+            400 <= status < 500
+            and action_index is not None
+            and self._events[action_index].get("classification") == "notification"
+            and self._valid_http_notification_rejection(action_index)
+        ):
+            return True
         if status != 404 or not self.session.profile.modern:
             return False
-        for later in self.recorder.events[event_index + 1 :]:
-            if later.get("direction") == "client_to_server":
+        # Incremental SSE delivers protocol messages before the terminal
+        # http_response evidence record, while buffered JSON historically
+        # delivered them on the other side. Correlate within the enclosing
+        # client action window instead of depending on recorder order.
+        action_id: Any = None
+        if action_index is None:
+            return False
+        action_id = self._events[action_index].get("id")
+        for candidate in self._events[action_index + 1 :]:
+            if (
+                candidate.get("direction") == "client_to_server"
+                and candidate.get("classification")
+                in {"request", "notification", "raw_wire"}
+            ):
                 break
-            payload = later.get("payload")
-            if response_error_code(payload) == -32601:
+            payload = candidate.get("payload")
+            if (
+                response_error_code(payload) == -32601
+                and isinstance(payload, dict)
+                and type(payload.get("id")) is type(action_id)
+                and payload.get("id") == action_id
+            ):
                 return True
         return False
 
+    def _previous_http_action_index(self, event_index: int) -> int | None:
+        for index in range(event_index - 1, -1, -1):
+            candidate = self._events[index]
+            if candidate.get("direction") == "client_to_server" and candidate.get(
+                "classification"
+            ) in {"request", "notification", "raw_wire"}:
+                return index
+        return None
+
+    def _http_action_events(self, action_index: int) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        for candidate in self._events[action_index + 1 :]:
+            if (
+                candidate.get("direction") == "client_to_server"
+                and candidate.get("classification")
+                in {"request", "notification", "raw_wire"}
+            ):
+                break
+            output.append(candidate)
+        return output
+
+    def _valid_http_notification_rejection(self, action_index: int) -> bool:
+        events = self._http_action_events(action_index)
+        protocol_messages = [
+            event
+            for event in events
+            if event.get("direction") == "server_to_client"
+            and event.get("classification") in {"request", "notification", "response", "invalid"}
+        ]
+        if not protocol_messages:
+            response = next(
+                (
+                    event
+                    for event in events
+                    if event.get("classification") == "http_response"
+                ),
+                None,
+            )
+            return response is not None and not response.get("byteLength")
+        return all(
+            event.get("classification") == "response"
+            and isinstance(event.get("payload"), dict)
+            and "id" not in event["payload"]
+            and isinstance(event["payload"].get("error"), dict)
+            for event in protocol_messages
+        )
+
     def _previous_client_class(self, event_index: int) -> str | None:
-        for earlier in reversed(self.recorder.events[:event_index]):
+        for earlier in reversed(self._events[:event_index]):
             if earlier.get("direction") == "client_to_server":
                 return earlier.get("classification")
         return None
 
     def _valid_list_page(self, response: InboundMessage, primitive: str) -> bool:
         payload = response.payload
-        return (
+        valid = (
             isinstance(payload, dict)
             and isinstance(payload.get("result"), dict)
             and isinstance(payload["result"].get(primitive), list)
         )
+        if not valid or not self.session.profile.modern:
+            return valid
+        result = payload["result"]
+        return (
+            result.get("resultType") == "complete"
+            and _finite_nonnegative_json_number(result.get("ttlMs"))
+            and result.get("cacheScope") in {"public", "private"}
+        )
+
+    def _response_id_anomalies(self) -> list[dict[str, Any]]:
+        outstanding: dict[tuple[str, str | int], int] = {}
+        anomalies: list[dict[str, Any]] = []
+        events = self._events
+        for index, event in enumerate(events):
+            direction = event.get("direction")
+            classification = event.get("classification")
+            payload = event.get("payload")
+            if direction == "client_to_server" and classification == "request":
+                key = _typed_rpc_key(payload.get("id") if isinstance(payload, dict) else None)
+                if key is not None:
+                    outstanding[key] = outstanding.get(key, 0) + 1
+                continue
+            if direction == "probe" and classification == "timeout":
+                key = _typed_rpc_key(event.get("requestId"))
+                if key is not None:
+                    outstanding.pop(key, None)
+                continue
+            if direction != "server_to_client" or classification != "response":
+                continue
+            key = _typed_rpc_key(payload.get("id") if isinstance(payload, dict) else None)
+            if key is not None and outstanding.get(key, 0):
+                remaining = outstanding[key] - 1
+                if remaining:
+                    outstanding[key] = remaining
+                else:
+                    outstanding.pop(key, None)
+                continue
+            if self._allowed_idless_http_notification_error(index, payload):
+                continue
+            anomalies.append(event)
+        return anomalies
+
+    def _allowed_idless_http_notification_error(
+        self, event_index: int, payload: Any
+    ) -> bool:
+        if not isinstance(self.session.transport, HttpTransport):
+            return False
+        if not (
+            isinstance(payload, dict)
+            and "id" not in payload
+            and isinstance(payload.get("error"), dict)
+        ):
+            return False
+        action_index: int | None = None
+        for index in range(event_index - 1, -1, -1):
+            candidate = self._events[index]
+            if candidate.get("direction") == "client_to_server" and candidate.get(
+                "classification"
+            ) in {"request", "notification", "raw_wire"}:
+                action_index = index
+                break
+        if action_index is None or self._events[action_index].get(
+            "classification"
+        ) != "notification":
+            return False
+        for candidate in self._events[action_index + 1 :]:
+            if (
+                candidate.get("direction") == "client_to_server"
+                and candidate.get("classification")
+                in {"request", "notification", "raw_wire"}
+            ):
+                break
+            status = candidate.get("httpStatus")
+            if candidate.get("classification") == "http_response" and type(status) is int:
+                return 400 <= status < 600
+        return False
 
     def _pagination_evidence(self, primitives: Iterable[str]) -> tuple[str, ...]:
         wanted = set(primitives)
@@ -1382,7 +2185,7 @@ class _CheckRun:
 
     def _http_server_requests(self) -> list[InboundMessage]:
         output: list[InboundMessage] = []
-        for event in self.recorder.events:
+        for event in self._events:
             if (
                 event.get("direction") == "server_to_client"
                 and event.get("transport") == "http"
@@ -1407,7 +2210,9 @@ class _CheckRun:
     def _build_report(self) -> CompatibilityReport:
         transcript = {
             "path": str(self.recorder.path) if self.recorder.path else None,
-            "eventCount": len(self.recorder.events),
+            "eventCount": len(self._events),
+            "firstSeq": self._events[0]["seq"] if self._events else None,
+            "lastSeq": self._events[-1]["seq"] if self._events else None,
             "redacted": True,
         }
         return CompatibilityReport(
@@ -1423,6 +2228,7 @@ class _CheckRun:
             findings=tuple(self.findings),
             errors=tuple(self.errors),
             transcript=transcript,
+            known_secrets=self.recorder.known_secrets,
         )
 
     def _add(
@@ -1473,13 +2279,12 @@ class _CheckRun:
         return f"event:{event['seq']}"
 
     def _last_evidence(self) -> tuple[str, ...]:
-        reference = self.recorder.last_reference()
-        return (reference,) if reference else ()
+        return (self._event_ref(self._events[-1]),) if self._events else ()
 
     def _events_by_class(self, classification: str) -> tuple[str, ...]:
         return tuple(
             self._event_ref(event)
-            for event in self.recorder.events
+            for event in self._events
             if event.get("classification") == classification
         )
 
@@ -1487,12 +2292,16 @@ class _CheckRun:
         return next(
             (
                 event
-                for event in self.recorder.events
+                for event in self._events
                 if event.get("direction") == "client_to_server"
                 and event.get("method") == method
             ),
             None,
         )
+
+    @property
+    def _events(self) -> list[dict[str, Any]]:
+        return self.recorder.events[self._event_start :]
 
     @staticmethod
     def _header(headers: Any, name: str) -> str | None:

@@ -80,22 +80,31 @@ class SchemaInspectionTests(unittest.TestCase):
         non_object["inputSchema"] = []
         wrong_type = tool("wrong-type")
         wrong_type["inputSchema"] = {"type": "array"}
+        missing_type = tool("missing-type")
+        missing_type["inputSchema"] = {"properties": {}}
         malformed_properties = tool("bad-properties")
         malformed_properties["inputSchema"] = {"type": "object", "properties": []}
 
-        issues = inspect_tool_schemas([missing, non_object, wrong_type, malformed_properties])
+        issues = inspect_tool_schemas(
+            [missing, non_object, wrong_type, missing_type, malformed_properties]
+        )
 
         expected = {
             "TOOL_INPUT_SCHEMA_MISSING": "/tools/0/inputSchema",
             "TOOL_INPUT_SCHEMA_NOT_OBJECT": "/tools/1/inputSchema",
             "TOOL_INPUT_SCHEMA_TYPE_NOT_OBJECT": "/tools/2/inputSchema/type",
-            "TOOL_INPUT_SCHEMA_PROPERTIES_NOT_OBJECT": "/tools/3/inputSchema/properties",
+            "TOOL_INPUT_SCHEMA_PROPERTIES_NOT_OBJECT": "/tools/4/inputSchema/properties",
         }
         for code, path in expected.items():
             issue = by_code(issues, code)[0]
             self.assertEqual("FAIL", issue.status)
             self.assertEqual("normative", issue.basis)
             self.assertEqual(path, issue.path)
+        type_issues = by_code(issues, "TOOL_INPUT_SCHEMA_TYPE_NOT_OBJECT")
+        self.assertEqual(
+            ["/tools/2/inputSchema/type", "/tools/3/inputSchema/type"],
+            [issue.path for issue in type_issues],
+        )
 
     def test_required_entries_distinguish_invalidity_from_portability_warning(self) -> None:
         non_array = tool("non-array")
