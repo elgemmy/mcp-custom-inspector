@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import base64
+import time
 import unittest
 
 from mcp_probe_core.redaction import (
     REDACTED,
     contains_redaction,
+    known_secrets_from_command,
+    known_secrets_from_environment,
+    known_secrets_from_headers,
+    known_secrets_from_url,
     redact_command,
     redact_headers,
     redact_raw,
@@ -90,6 +96,21 @@ class RedactionTests(unittest.TestCase):
         for secret in ("alice", "hunter2", "abc", "frag"):
             self.assertNotIn(secret, safe)
 
+    def test_url_redacts_short_and_oauth_credential_query_names(self) -> None:
+        safe = redact_url(
+            "https://example.test/mcp?key=key-secret&sig=sig-secret&code=code-secret&"
+            "code_verifier=verifier-secret&client_assertion=assertion-secret&plain=yes"
+        )
+        for secret in (
+            "key-secret",
+            "sig-secret",
+            "code-secret",
+            "verifier-secret",
+            "assertion-secret",
+        ):
+            self.assertNotIn(secret, safe)
+        self.assertIn("plain=yes", safe)
+
     def test_malformed_url_does_not_raise_or_leak_query_token(self) -> None:
         safe = redact_url(
             "http://alice:hunter2@example.test:not-a-port/mcp?token=port-secret#fragment-secret"
@@ -111,6 +132,12 @@ class RedactionTests(unittest.TestCase):
                 "-H",
                 "Cookie: sid=separate-header-secret",
                 "https://example.test/mcp?access_token=url-secret&plain=yes",
+                "--auth-token",
+                "auth-secret",
+                "--private-key=private-secret",
+                "--cookie",
+                "cookie-flag-secret",
+                "sh -c 'server --session-id shell-secret --token=shell-token'",
             ]
         )
         rendered = repr(safe)
@@ -122,6 +149,11 @@ class RedactionTests(unittest.TestCase):
             "inline-header-secret",
             "separate-header-secret",
             "url-secret",
+            "auth-secret",
+            "private-secret",
+            "cookie-flag-secret",
+            "shell-secret",
+            "shell-token",
         ):
             self.assertNotIn(secret, rendered)
         self.assertEqual(safe[2], REDACTED)
@@ -150,6 +182,8 @@ class RedactionTests(unittest.TestCase):
             "request failed with Authorization: Bearer embedded-secret\n"
             "Authorization: Bearer auth-secret\n"
             "Set-Cookie: sid=cookie-secret\n"
+            "DPoP: dpop-header-secret\n"
+            "standalone Bearer bearer-secret and Basic basic-secret and DPoP dpop-secret\n"
             "NOTION_TOKEN=env-secret ordinary text"
         )
         for secret in (
@@ -157,9 +191,48 @@ class RedactionTests(unittest.TestCase):
             "auth-secret",
             "cookie-secret",
             "env-secret",
+            "dpop-header-secret",
+            "bearer-secret",
+            "basic-secret",
+            "dpop-secret",
         ):
             self.assertNotIn(secret, safe)
         self.assertIn("ordinary text", safe)
+
+    def test_known_secret_extraction_covers_basic_cookies_userinfo_query_and_env(self) -> None:
+        basic = base64.b64encode(b"alice:hunter2").decode("ascii")
+        header_secrets = known_secrets_from_headers(
+            {
+                "Authorization": f"Basic {basic}",
+                "Cookie": 'sid="cookie-secret"; csrf=csrf-secret',
+            }
+        )
+        for secret in (basic, "alice", "hunter2", "cookie-secret", "csrf-secret"):
+            self.assertIn(secret, header_secrets)
+
+        url_secrets = known_secrets_from_url(
+            "https://al%69ce:hunter%32@example.test/mcp?token=abc%2Fdef&plain=yes"
+        )
+        for secret in ("alice", "hunter2", "abc/def", "abc%2Fdef"):
+            self.assertIn(secret, url_secrets)
+        self.assertNotIn("yes", url_secrets)
+
+        command_secrets = known_secrets_from_command(
+            ["server", "--header", f"Authorization: Basic {basic}"]
+        )
+        self.assertIn("hunter2", command_secrets)
+        self.assertEqual(
+            known_secrets_from_environment(
+                {"NOTION_TOKEN": "env-secret", "VISIBLE": "safe"}
+            ),
+            {"env-secret"},
+        )
+
+    def test_raw_redaction_is_linear_for_delimiter_free_hostile_input(self) -> None:
+        started = time.monotonic()
+        for raw in ("a" * (64 * 1024), '"' * (64 * 1024)):
+            self.assertEqual(redact_raw(raw), raw)
+        self.assertLess(time.monotonic() - started, 2.0)
 
 
 if __name__ == "__main__":
