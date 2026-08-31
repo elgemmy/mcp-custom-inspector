@@ -1,0 +1,40 @@
+{
+  "schema": "mcp-probe.scenario/v1",
+  "name": "safe-discovery-and-unknown-method",
+  "description": "Establish MCP, inspect tools without calling them, then verify method-not-found.",
+  "timeout": 5,
+  "actions": [
+    {
+      "action": "connect",
+      "establish": true
+    },
+    {
+      "action": "discover",
+      "primitive": "tools",
+      "maxPages": 20
+    },
+    {
+      "action": "expect",
+      "kind": "result",
+      "assertions": [
+        {
+          "path": "/result/tools",
+          "type": "array"
+        }
+      ]
+    },
+    {
+      "action": "request",
+      "method": "mcp-probe/example-unknown-method",
+      "params": {}
+    },
+    {
+      "action": "expect",
+      "kind": "error",
+      "code": -32601
+    },
+    {
+      "action": "disconnect"
+    }
+  ]
+}
