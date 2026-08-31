@@ -37,20 +37,22 @@ def modern_stdio_command(*, send_server_request: bool = False) -> list[str]:
                 if SEND_REQUEST:
                     print(json.dumps({{"jsonrpc":"2.0","id":"modern-forbidden","method":"roots/list","params":{{}}}}), flush=True)
                 result = {{
-                    "resultType":"server/discover",
+                    "resultType":"complete",
                     "supportedVersions":["2026-07-28"],
                     "capabilities":{{"tools":{{}}}},
                     "ttlMs":1000,
-                    "cacheScope":"connection",
+                    "cacheScope":"private",
                     "_meta":{{"io.modelcontextprotocol/serverInfo":{{"name":"modern-fixture","version":"1"}}}},
                 }}
             elif method == "tools/list":
                 result = {{
-                    "resultType":"tools/list",
+                    "resultType":"complete",
                     "tools":[{{"name":"modern_echo","inputSchema":{{"type":"object"}}}}],
+                    "ttlMs":1000,
+                    "cacheScope":"private",
                 }}
             elif method == "ping":
-                result = {{"resultType":"ping"}}
+                result = {{"resultType":"complete"}}
             else:
                 print(json.dumps({{"jsonrpc":"2.0","id":request_id,"error":{{"code":-32601,"message":"Method not found"}}}}), flush=True)
                 continue
@@ -83,11 +85,11 @@ def running_modern_http() -> Iterator[tuple[str, list[dict[str, Any]]]]:
             method = message.get("method")
             if method == "server/discover":
                 result = {
-                    "resultType": "server/discover",
+                    "resultType": "complete",
                     "supportedVersions": [MODERN_VERSION],
                     "capabilities": {"tools": {}},
                     "ttlMs": 1000,
-                    "cacheScope": "connection",
+                    "cacheScope": "private",
                     "_meta": {
                         "io.modelcontextprotocol/serverInfo": {
                             "name": "modern-http",
@@ -97,7 +99,7 @@ def running_modern_http() -> Iterator[tuple[str, list[dict[str, Any]]]]:
                 }
             elif method == "tools/list":
                 result = {
-                    "resultType": "tools/list",
+                    "resultType": "complete",
                     "tools": [
                         {
                             "name": "modern_header",
@@ -112,15 +114,17 @@ def running_modern_http() -> Iterator[tuple[str, list[dict[str, Any]]]]:
                             },
                         }
                     ],
+                    "ttlMs": 1000,
+                    "cacheScope": "private",
                 }
             elif method == "tools/call":
                 result = {
-                    "resultType": "tools/call",
+                    "resultType": "complete",
                     "content": [{"type": "text", "text": "ok"}],
                     "isError": False,
                 }
             else:
-                result = {"resultType": method or "unknown"}
+                result = {"resultType": "complete"}
             response = json.dumps(
                 {"jsonrpc": "2.0", "id": message.get("id"), "result": result},
                 separators=(",", ":"),
@@ -221,7 +225,7 @@ class LegacySessionTests(unittest.TestCase):
         )
         try:
             result = session.establish(1)
-            self.assertTrue(result.success)
+            self.assertFalse(result.success)
             sent = next(
                 event
                 for event in recorder.events
@@ -260,7 +264,7 @@ class LegacySessionTests(unittest.TestCase):
         finally:
             session.close()
 
-    def test_roots_server_request_is_answered_during_initialize(self) -> None:
+    def test_roots_server_request_during_initialize_gets_not_initialized_error(self) -> None:
         roots = [{"uri": "file:///safe/root", "name": "fixture-root"}]
         config = SessionConfig(
             protocol_version=LEGACY_VERSION,
@@ -268,7 +272,9 @@ class LegacySessionTests(unittest.TestCase):
             roots=roots,
         )
         session, transport, recorder = self.make_stdio_session(
-            "stdio-server-request", config=config
+            "stdio-server-request",
+            config=config,
+            extra_args=("--server-request-mode", "roots-early"),
         )
         try:
             self.assertTrue(session.establish(1).success)
@@ -281,40 +287,44 @@ class LegacySessionTests(unittest.TestCase):
                 if event.get("id") == "fixture-roots-request"
                 and event.get("classification") == "response"
             )
-            self.assertEqual(reply["payload"]["result"]["roots"], roots)
+            self.assertEqual(reply["payload"]["error"]["code"], -32002)
+            self.assertTrue(
+                any(
+                    event["classification"] == "pre_initialized_server_request"
+                    for event in recorder.events
+                )
+            )
         finally:
             session.close()
 
     def test_unsupported_legacy_server_request_gets_explicit_method_not_found(self) -> None:
-        script = textwrap.dedent(
-            """
-            import json, sys
-            initialize = json.loads(sys.stdin.readline())
-            print(json.dumps({"jsonrpc":"2.0","id":"server-call","method":"sampling/createMessage","params":{}}), flush=True)
-            reply = json.loads(sys.stdin.readline())
-            print(json.dumps({"jsonrpc":"2.0","id":initialize["id"],"result":{
-                "protocolVersion":"2025-06-18","capabilities":{},
-                "serverInfo":{"name":"server-request","version":"1"},
-                "_reply":reply}}), flush=True)
-            for _line in sys.stdin:
-                pass
-            """
-        )
         recorder = EventRecorder()
-        transport = StdioTransport([sys.executable, "-u", "-c", script], {}, recorder)
+        transport = StdioTransport(
+            stdio_fixture_command(
+                "stdio-good-legacy",
+                "--server-request-mode",
+                "unsupported-post",
+            ),
+            {},
+            recorder,
+        )
         session = McpSession(
             transport, SessionConfig(protocol_version=LEGACY_VERSION), recorder
         )
         try:
             self.assertTrue(session.establish(1).success)
+            self.assertTrue(session.paginate("tools", 1).complete)
             response = next(
                 event
                 for event in recorder.events
-                if event.get("id") == "server-call"
+                if event.get("id") == "fixture-roots-request"
                 and event.get("classification") == "response"
             )
             self.assertEqual(response["payload"]["error"]["code"], -32601)
-            self.assertIn("sampling/createMessage", response["payload"]["error"]["message"])
+            self.assertIn(
+                "fixture/unsupported-client-method",
+                response["payload"]["error"]["message"],
+            )
         finally:
             session.close()
 

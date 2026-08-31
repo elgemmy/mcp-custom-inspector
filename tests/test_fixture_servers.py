@@ -97,7 +97,9 @@ class StdioFixtureTests(unittest.TestCase):
 
     def test_server_request_blocks_initialize_until_client_response(self) -> None:
         process = subprocess.Popen(
-            stdio_fixture_command("stdio-server-request"),
+            stdio_fixture_command(
+                "stdio-server-request", "--server-request-mode", "roots-early"
+            ),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

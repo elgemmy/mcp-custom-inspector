@@ -4,13 +4,14 @@ import contextlib
 import datetime as dt
 import io
 import json
+import os
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
 
-from mcp_probe_core.errors import ConfigurationError
+from mcp_probe_core.errors import ConfigurationError, TransportError
 from mcp_probe_core.redaction import REDACTED
 from mcp_probe_core.transcript import (
     TRANSCRIPT_EVENT_SCHEMA,
@@ -20,6 +21,33 @@ from mcp_probe_core.transcript import (
 
 
 class TranscriptTests(unittest.TestCase):
+    def test_capture_limit_is_one_coalesced_marker_and_cannot_pass_cleanly(self) -> None:
+        recorder = EventRecorder(max_events=3, max_capture_bytes=4096)
+        recorder.record("probe", "stdio", classification="one")
+        recorder.record("probe", "stdio", classification="two")
+        with self.assertRaises(TransportError):
+            recorder.record("probe", "stdio", classification="three")
+        self.assertTrue(recorder.capture_truncated)
+        self.assertEqual(len(recorder.events), 3)
+        self.assertEqual(recorder.events[-1]["classification"], "capture_limit")
+        reference = recorder.record("probe", "stdio", classification="dropped")
+        self.assertEqual(reference, "event:3")
+        self.assertEqual(len(recorder.events), 3)
+        with self.assertRaises(TransportError):
+            recorder.raise_if_truncated()
+
+    def test_capture_byte_limit_keeps_only_a_bounded_marker(self) -> None:
+        recorder = EventRecorder(max_events=100, max_capture_bytes=2048)
+        with self.assertRaises(TransportError):
+            recorder.record(
+                "server_to_client",
+                "stdio",
+                classification="stderr",
+                raw="x" * 4096,
+            )
+        self.assertEqual(len(recorder.events), 1)
+        self.assertEqual(recorder.events[0]["classification"], "capture_limit")
+
     def test_event_has_stable_evidence_sequence_timing_and_rpc_fields(self) -> None:
         recorder = EventRecorder()
         first = recorder.record(
@@ -65,10 +93,24 @@ class TranscriptTests(unittest.TestCase):
             recorder.close()
             recorder.close()
 
+            if os.name == "posix":
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
             loaded = load_transcript(path)
             self.assertEqual([event["seq"] for event in loaded], [1, 2])
             self.assertEqual(loaded[1]["exitCode"], 17)
             self.assertEqual(loaded[1]["error"], "child crashed")
+
+    def test_existing_transcript_permissions_are_constrained(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "trace.ndjson"
+            path.write_text("old", encoding="utf-8")
+            os.chmod(path, 0o644)
+            recorder = EventRecorder(str(path))
+            recorder.record("probe", "stdio", classification="event")
+            recorder.close()
+            if os.name == "posix":
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_every_sink_receives_redacted_payload_raw_headers_url_error_and_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -118,6 +160,96 @@ class TranscriptTests(unittest.TestCase):
                 ):
                     self.assertNotIn(secret, representation)
                 self.assertIn(REDACTED, representation)
+
+    def test_configured_secrets_are_scoped_to_one_recorder(self) -> None:
+        first = EventRecorder()
+        first.register_secrets(("PASS", "/", "configured-secret"))
+        first.record(
+            "server_to_client",
+            "stdio",
+            payload={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "echo": "configured-secret",
+                    "status": "PASS",
+                    "method": "tools/list",
+                },
+            },
+            exactBytesRecorded=True,
+        )
+        serialized = json.dumps(first.events)
+        self.assertNotIn("configured-secret", serialized)
+        self.assertIn('"exactBytesRecorded": true', serialized)
+
+        second = EventRecorder()
+        second.record(
+            "server_to_client",
+            "stdio",
+            payload={"echo": "configured-secret"},
+        )
+        self.assertEqual(
+            second.events[0]["payload"]["echo"], "configured-secret"
+        )
+
+    def test_secret_collisions_preserve_jsonrpc_envelope_and_public_method(self) -> None:
+        recorder = EventRecorder()
+        recorder.register_secrets(
+            ("jsonrpc", "result", "code", "tools/list", "PASS", "extension")
+        )
+        recorder.record(
+            "client_to_server",
+            "stdio",
+            payload={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {"extension": "PASS"},
+            },
+        )
+        recorder.record(
+            "server_to_client",
+            "stdio",
+            payload={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"tools": [], "extension": "PASS"},
+            },
+        )
+
+        request, response = recorder.events
+        self.assertEqual(request["classification"], "request")
+        self.assertEqual(request["method"], "tools/list")
+        self.assertEqual(request["payload"]["jsonrpc"], "2.0")
+        self.assertIn("params", request["payload"])
+        self.assertEqual(response["classification"], "response")
+        self.assertIn("result", response["payload"])
+        self.assertNotIn("extension", json.dumps((request, response)))
+        self.assertNotIn("PASS", json.dumps((request, response)))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX filesystem semantics required")
+    def test_transcript_refuses_symlink_hardlink_and_fifo_without_modifying_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            victim = directory / "victim"
+            victim.write_text("preserve-me", encoding="utf-8")
+
+            symlink = directory / "symlink.ndjson"
+            symlink.symlink_to(victim)
+            with self.assertRaises(ConfigurationError):
+                EventRecorder(str(symlink))
+            self.assertEqual(victim.read_text(encoding="utf-8"), "preserve-me")
+
+            hardlink = directory / "hardlink.ndjson"
+            os.link(victim, hardlink)
+            with self.assertRaises(ConfigurationError):
+                EventRecorder(str(hardlink))
+            self.assertEqual(victim.read_text(encoding="utf-8"), "preserve-me")
+
+            fifo = directory / "fifo.ndjson"
+            os.mkfifo(fifo)
+            with self.assertRaises(ConfigurationError):
+                EventRecorder(str(fifo))
 
     def test_http_status_headers_and_sse_metadata_are_recorded(self) -> None:
         recorder = EventRecorder()
@@ -210,6 +342,13 @@ class TranscriptTests(unittest.TestCase):
                         path.write_text(content, encoding="utf-8")
                     with self.assertRaises(ConfigurationError):
                         load_transcript(path)
+
+    def test_load_wraps_invalid_utf8_as_configuration_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "invalid.ndjson"
+            path.write_bytes(b"\xff\xfe")
+            with self.assertRaisesRegex(ConfigurationError, "Could not read transcript"):
+                load_transcript(path)
 
 
 if __name__ == "__main__":

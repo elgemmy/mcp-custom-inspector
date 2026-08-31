@@ -61,8 +61,10 @@ class ReplayTestCase(unittest.TestCase):
             recorder.close()
         return path
 
-    def stdio_transport(self, profile: str, recorder: EventRecorder) -> StdioTransport:
-        return StdioTransport(stdio_fixture_command(profile), {}, recorder)
+    def stdio_transport(
+        self, profile: str, recorder: EventRecorder, *extra: str
+    ) -> StdioTransport:
+        return StdioTransport(stdio_fixture_command(profile, *extra), {}, recorder)
 
 
 class StdioReplayIntegrationTests(ReplayTestCase):
@@ -321,7 +323,12 @@ class StdioReplayIntegrationTests(ReplayTestCase):
             ]
         )
         recorder = EventRecorder()
-        transport = self.stdio_transport("stdio-server-request", recorder)
+        transport = self.stdio_transport(
+            "stdio-server-request",
+            recorder,
+            "--server-request-mode",
+            "roots-early",
+        )
         # Deliberately install the session's automatic roots/list response. A
         # literal replay must temporarily suppress it.
         session = McpSession(

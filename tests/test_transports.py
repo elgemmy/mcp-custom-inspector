@@ -8,12 +8,14 @@ import socket
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 from typing import Any, Iterator
+from unittest import mock
 
 from mcp_probe_core.errors import ProbeTimeout, ProcessExited, TransportError
 from mcp_probe_core.protocol import make_notification, make_request, profile_for
@@ -91,7 +93,137 @@ def running_static_http(
         thread.join(timeout=2)
 
 
+@contextlib.contextmanager
+def running_http_handler(
+    handler: type[BaseHTTPRequestHandler],
+) -> Iterator[str]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server.daemon_threads = True
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/mcp"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 class StdioTransportTests(unittest.TestCase):
+    def test_2025_03_batch_items_are_evidenced_and_server_replies_grouped(self) -> None:
+        script = textwrap.dedent(
+            """
+            import json, sys
+            request = json.loads(sys.stdin.readline())
+            batch = [
+                {"jsonrpc":"2.0","id":"server-ping","method":"ping","params":{}},
+                {"jsonrpc":"2.0","id":request["id"],"result":{"ok":True}},
+            ]
+            print(json.dumps(batch, separators=(",", ":")), flush=True)
+            reply = json.loads(sys.stdin.readline())
+            print(json.dumps({"jsonrpc":"2.0","method":"fixture/batch-reply","params":{"reply":reply}}, separators=(",", ":")), flush=True)
+            for _line in sys.stdin:
+                pass
+            """
+        )
+        recorder = EventRecorder()
+        transport = StdioTransport(
+            [sys.executable, "-u", "-c", script],
+            {},
+            recorder,
+            profile=profile_for("2025-03-26"),
+        )
+        transport.server_request_handler = lambda inbound: {
+            "jsonrpc": "2.0",
+            "id": inbound.payload["id"],
+            "result": {},
+        }
+        transport.start()
+        try:
+            transport.send_message(make_request("ping", 1, {}), 1)
+            response = transport.wait_for_response(1, 1)
+            self.assertEqual(response.payload["result"], {"ok": True})
+            notification = transport.receive(1)
+            self.assertEqual(notification.payload["method"], "fixture/batch-reply")
+            reply = notification.payload["params"]["reply"]
+            self.assertIsInstance(reply, list)
+            self.assertEqual(reply[0]["id"], "server-ping")
+        finally:
+            transport.close()
+        classes = [event["classification"] for event in recorder.events]
+        self.assertIn("batch", classes)
+        item_events = [event for event in recorder.events if "batchEvidence" in event]
+        self.assertEqual(len(item_events), 2)
+
+    def test_newer_profile_quarantines_inbound_batch(self) -> None:
+        script = textwrap.dedent(
+            """
+            import json, sys
+            request = json.loads(sys.stdin.readline())
+            print(json.dumps([{"jsonrpc":"2.0","id":request["id"],"result":{}}]), flush=True)
+            """
+        )
+        recorder = EventRecorder()
+        transport = StdioTransport(
+            [sys.executable, "-u", "-c", script],
+            {},
+            recorder,
+            profile=profile_for("2025-06-18"),
+        )
+        transport.start()
+        try:
+            transport.send_message(make_request("ping", 1, {}), 1)
+            with self.assertRaises(ProcessExited):
+                transport.wait_for_response(1, 1, cancel_on_timeout=False)
+            invalid = transport.observed_invalid_messages()
+            self.assertTrue(any(item.classification == "invalid_batch" for item in invalid))
+        finally:
+            transport.close()
+
+    def test_write_backpressure_times_out_and_kills_non_reader(self) -> None:
+        script = "import time; time.sleep(60)"
+        recorder = EventRecorder()
+        transport = StdioTransport(
+            [sys.executable, "-u", "-c", script],
+            {},
+            recorder,
+            max_message_bytes=128 * 1024,
+            shutdown_timeout=0.1,
+            write_timeout=0.05,
+        )
+        transport.start()
+        started = time.monotonic()
+        with self.assertRaises(TransportError):
+            transport.send_wire(b"x" * (128 * 1024 - 1), timeout=0.05)
+        self.assertLess(time.monotonic() - started, 1.0)
+        cleanup = transport.close()
+        self.assertIsNotNone(cleanup.returncode)
+        self.assertTrue(
+            any(event["classification"] == "write_timeout" for event in recorder.events)
+        )
+
+    def test_outgoing_wire_limit_fails_before_full_payload_capture(self) -> None:
+        recorder = EventRecorder()
+        transport = StdioTransport(
+            [sys.executable, "-u", "-c", "import sys; list(sys.stdin)"],
+            {},
+            recorder,
+            max_message_bytes=64,
+        )
+        transport.start()
+        try:
+            with self.assertRaises(TransportError):
+                transport.send_wire(b"x" * 65)
+        finally:
+            transport.close()
+        event = next(
+            item
+            for item in recorder.events
+            if item["classification"] == "outgoing_message_too_large"
+        )
+        self.assertEqual(event["byteLength"], 66)
+        self.assertNotIn("raw", event)
+
     def test_good_partial_response_stderr_and_cleanup_cross_process_boundary(self) -> None:
         recorder = EventRecorder()
         transport = StdioTransport(
@@ -274,6 +406,50 @@ class StdioTransportTests(unittest.TestCase):
         finally:
             transport.close()
 
+    def test_close_racing_server_request_handler_does_not_escape_reader_thread(self) -> None:
+        script = textwrap.dedent(
+            """
+            import json, sys
+            first = json.loads(sys.stdin.readline())
+            print(json.dumps({"jsonrpc":"2.0","id":first["id"],"result":{
+                "protocolVersion":"2025-06-18","capabilities":{},
+                "serverInfo":{"name":"closing-request","version":"1"}}}), flush=True)
+            print(json.dumps({"jsonrpc":"2.0","id":"late","method":"roots/list","params":{}}), flush=True)
+            for _line in sys.stdin:
+                pass
+            """
+        )
+        recorder = EventRecorder()
+        transport = StdioTransport([sys.executable, "-u", "-c", script], {}, recorder)
+        handler_started = threading.Event()
+        release_handler = threading.Event()
+
+        def handler(message: Any) -> dict[str, Any]:
+            handler_started.set()
+            release_handler.wait(1)
+            return {"jsonrpc": "2.0", "id": message.payload["id"], "result": {}}
+
+        transport.server_request_handler = handler
+        transport.start()
+        transport.send_message(initialize_request())
+        transport.wait_for_response(1, 1)
+        self.assertTrue(handler_started.wait(1))
+
+        close_thread = threading.Thread(target=transport.close)
+        close_thread.start()
+        self.assertTrue(transport._closing.wait(1))
+        release_handler.set()
+        close_thread.join(2)
+        self.assertFalse(close_thread.is_alive())
+        for thread in transport._threads:
+            thread.join(1)
+        self.assertTrue(
+            any(
+                event["classification"] == "server_request_response_skipped"
+                for event in recorder.events
+            )
+        )
+
     def test_max_plus_one_line_is_rejected_even_when_it_ends_in_newline(self) -> None:
         script = "import sys; sys.stdout.buffer.write(b'12345678\\n'); sys.stdout.flush()"
         recorder = EventRecorder()
@@ -421,6 +597,49 @@ class HttpTransportTests(unittest.TestCase):
             profile_for(version),
             max_body_bytes=max_body_bytes,
         )
+
+    def test_http_json_batch_is_profile_gated_and_items_are_correlatable(self) -> None:
+        body = json.dumps(
+            [
+                {"jsonrpc": "2.0", "method": "notifications/progress", "params": {}},
+                {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}},
+            ],
+            separators=(",", ":"),
+        ).encode()
+        with running_static_http(body) as url:
+            recorder = EventRecorder()
+            transport = self.make_transport(url, recorder, version="2025-03-26")
+            result = transport.rpc("ping", {}, 1)
+            self.assertEqual(result.response.payload["result"], {"ok": True})
+            self.assertEqual(len(result.exchange.messages), 2)
+            self.assertTrue(
+                all(
+                    "batchEvidence" in event
+                    for event in recorder.events
+                    if event.get("batchIndex") is not None
+                )
+            )
+
+        with running_static_http(body) as url:
+            recorder = EventRecorder()
+            transport = self.make_transport(url, recorder, version="2025-06-18")
+            with self.assertRaises(TransportError):
+                transport.rpc("ping", {}, 1)
+            self.assertTrue(
+                any(event["classification"] == "invalid_batch" for event in recorder.events)
+            )
+
+    def test_sse_parser_enforces_event_issue_id_and_line_limits(self) -> None:
+        event = 'data: {"jsonrpc":"2.0","method":"n"}\n\n'
+        with self.assertRaises(TransportError):
+            parse_sse_messages(event * 1001)
+        with self.assertRaises(TransportError):
+            parse_sse_messages("retry: nope\n" * 101)
+        with self.assertRaises(TransportError):
+            parse_sse_messages("id: " + "x" * 4097 + "\n\n")
+        with mock.patch("mcp_probe_core.transports.MAX_SSE_FIELD_BYTES", 32):
+            with self.assertRaises(TransportError):
+                parse_sse_messages(":" + "x" * 33 + "\n\n")
 
     def test_json_and_multi_event_sse_match_response_not_last_message(self) -> None:
         for profile, expected_messages in (("http-json", 1), ("http-sse", 1), ("http-sse-multi", 2)):
@@ -593,6 +812,237 @@ class HttpTransportTests(unittest.TestCase):
                 transport.send_message(initialize_request(), 1)
             self.assertIn("exceeded 32 bytes", str(raised.exception))
 
+    def test_persistent_sse_returns_after_correlated_response_and_ignores_empty_priming(self) -> None:
+        handler_finished = threading.Event()
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *args: Any) -> None:
+                del args
+
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0"))
+                request = json.loads(self.rfile.read(length))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": {"ok": True},
+                }
+                # Bare CR is a valid SSE line terminator, including on a
+                # response stream which deliberately remains open.
+                self.wfile.write(b"id: primed\rdata:\r\r")
+                self.wfile.write(
+                    f"data: {json.dumps(response, separators=(',', ':'))}\r\r".encode()
+                )
+                self.wfile.flush()
+                handler_finished.wait(0.75)
+
+        with running_http_handler(Handler) as url:
+            recorder = EventRecorder()
+            transport = self.make_transport(url, recorder)
+            started = time.monotonic()
+            result = transport.rpc("ping", {}, 0.4)
+            elapsed = time.monotonic() - started
+            handler_finished.set()
+        self.assertLess(elapsed, 0.3)
+        self.assertEqual(result.response.payload["result"], {"ok": True})
+        self.assertEqual(len(result.exchange.messages), 1)
+        self.assertEqual(result.response.sse_id, "primed")
+        self.assertEqual(result.exchange.parse_issues, [])
+
+    def test_sse_server_request_is_answered_before_final_response_exactly_once(self) -> None:
+        reply_received = threading.Event()
+        keep_outer_open = threading.Event()
+        received_replies: list[Any] = []
+        handler_calls: list[Any] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *args: Any) -> None:
+                del args
+
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0"))
+                message = json.loads(self.rfile.read(length))
+                if "method" not in message:
+                    received_replies.append(message)
+                    self.send_response(202)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    reply_received.set()
+                    return
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                server_request = {
+                    "jsonrpc": "2.0",
+                    "id": "server-roots",
+                    "method": "roots/list",
+                    "params": {},
+                }
+                self.wfile.write(
+                    f"data: {json.dumps(server_request, separators=(',', ':'))}\n\n".encode()
+                )
+                self.wfile.flush()
+                if not reply_received.wait(0.6):
+                    return
+                response = {"jsonrpc": "2.0", "id": message["id"], "result": {}}
+                self.wfile.write(
+                    f"data: {json.dumps(response, separators=(',', ':'))}\n\n".encode()
+                )
+                self.wfile.flush()
+                keep_outer_open.wait(0.75)
+
+        with running_http_handler(Handler) as url:
+            recorder = EventRecorder()
+            transport = self.make_transport(url, recorder)
+
+            def answer(inbound: Any) -> dict[str, Any]:
+                handler_calls.append(inbound.payload)
+                return {
+                    "jsonrpc": "2.0",
+                    "id": inbound.payload["id"],
+                    "result": {"roots": []},
+                }
+
+            transport.server_request_handler = answer
+            result = transport.rpc("ping", {}, 0.8)
+            keep_outer_open.set()
+        self.assertEqual(result.response.payload["id"], 1)
+        self.assertEqual(len(handler_calls), 1)
+        self.assertEqual(len(received_replies), 1)
+        self.assertEqual(received_replies[0]["id"], "server-roots")
+        request = next(
+            message
+            for message in result.exchange.messages
+            if message.classification == "request"
+        )
+        self.assertTrue(request.handled)
+        response_markers = [
+            event
+            for event in recorder.events
+            if event["classification"] == "server_request_response"
+        ]
+        self.assertEqual(len(response_markers), 1)
+        self.assertEqual(response_markers[0]["requestId"], "server-roots")
+        self.assertEqual(response_markers[0]["httpStatus"], 202)
+        self.assertTrue(response_markers[0]["idMatched"])
+
+    def test_sse_trickle_is_bounded_by_total_deadline(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *args: Any) -> None:
+                del args
+
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0"))
+                request = json.loads(self.rfile.read(length))
+                payload = (
+                    f"data: {json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': {}})}\n\n"
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                try:
+                    for byte in payload:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                        time.sleep(0.025)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        with running_http_handler(Handler) as url:
+            transport = self.make_transport(url, EventRecorder())
+            started = time.monotonic()
+            with self.assertRaises(ProbeTimeout):
+                transport.rpc("ping", {}, 0.12)
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.35)
+
+    def test_redirect_is_exposed_without_forwarding_credentials(self) -> None:
+        target_received = threading.Event()
+        target_headers: list[dict[str, str]] = []
+
+        class TargetHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *args: Any) -> None:
+                del args
+
+            def do_POST(self) -> None:  # noqa: N802
+                target_headers.append({key.lower(): value for key, value in self.headers.items()})
+                target_received.set()
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        with running_http_handler(TargetHandler) as target_url:
+            class RedirectHandler(BaseHTTPRequestHandler):
+                protocol_version = "HTTP/1.1"
+
+                def log_message(self, _format: str, *args: Any) -> None:
+                    del args
+
+                def do_POST(self) -> None:  # noqa: N802
+                    length = int(self.headers.get("Content-Length", "0"))
+                    self.rfile.read(length)
+                    self.send_response(307)
+                    self.send_header("Location", target_url)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+
+            with running_http_handler(RedirectHandler) as redirect_url:
+                transport = self.make_transport(
+                    redirect_url,
+                    EventRecorder(),
+                    headers={"Authorization": "Bearer redirect-private"},
+                )
+                exchange = transport.send_message(initialize_request(), 0.5)
+                time.sleep(0.05)
+        self.assertEqual(exchange.status, 307)
+        self.assertFalse(target_received.is_set())
+        self.assertEqual(target_headers, [])
+
+    def test_invalid_session_id_is_never_stored_or_resent(self) -> None:
+        body = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": LEGACY_VERSION}}
+        ).encode()
+        with running_static_http(
+            body, headers={"Mcp-Session-Id": "invalid session"}
+        ) as url:
+            recorder = EventRecorder()
+            transport = self.make_transport(url, recorder)
+            with self.assertRaises(TransportError) as raised:
+                transport.send_message(initialize_request(), 0.5)
+        self.assertIsNone(transport.session_id)
+        self.assertIn("invalid MCP-Session-Id", str(raised.exception))
+        self.assertTrue(
+            any(event["classification"] == "invalid_session_id" for event in recorder.events)
+        )
+
+    def test_http_raw_wire_marks_non_utf8_bytes_as_inexact(self) -> None:
+        with running_static_http(b"", status=400, content_type=None) as url:
+            recorder = EventRecorder()
+            transport = self.make_transport(url, recorder)
+            transport.send_wire(b"\xff\xfe", 0.5)
+            transport.send_wire(b"{}", 0.5)
+        raw_events = [
+            event for event in recorder.events if event["classification"] == "raw_wire"
+        ]
+        self.assertEqual(
+            [event["exactBytesRecorded"] for event in raw_events], [False, True]
+        )
+
     def test_sse_parser_handles_multiple_data_lines_issues_and_persistent_event_id(self) -> None:
         body = (
             "id: event-1\n"
@@ -606,6 +1056,14 @@ class HttpTransportTests(unittest.TestCase):
         self.assertEqual(len(parsed), 2)
         self.assertEqual([event_id for _payload, _event, event_id, _raw in parsed], ["event-1", "event-1"])
         self.assertTrue(any("retry" in issue for issue in issues))
+
+    def test_sse_parser_ignores_empty_data_priming_event(self) -> None:
+        parsed, issues = parse_sse_messages(
+            'id: prime\ndata:\n\ndata: {"jsonrpc":"2.0","id":1,"result":{}}\n\n'
+        )
+        self.assertEqual(issues, [])
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0][2], "prime")
 
     def test_non_json_content_type_issue_is_preserved_when_body_is_malformed(self) -> None:
         parsed, issues = parse_http_messages("not-json", "text/plain")

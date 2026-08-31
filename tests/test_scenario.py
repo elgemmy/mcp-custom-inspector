@@ -455,7 +455,9 @@ class StdioScenarioTests(unittest.TestCase):
 
     def test_server_request_can_be_expected_while_waiting_for_initialize(self) -> None:
         session, recorder = stdio_session(
-            "stdio-server-request", capabilities={"roots": {"listChanged": False}}
+            "stdio-server-request",
+            capabilities={"roots": {"listChanged": False}},
+            extra=("--server-request-mode", "roots-early"),
         )
         scenario = definition(
             [
@@ -516,7 +518,9 @@ class StdioScenarioTests(unittest.TestCase):
 
     def test_server_request_auto_response_can_be_disabled_for_exact_control(self) -> None:
         session, recorder = stdio_session(
-            "stdio-server-request", capabilities={"roots": {"listChanged": False}}
+            "stdio-server-request",
+            capabilities={"roots": {"listChanged": False}},
+            extra=("--server-request-mode", "roots-early"),
         )
         scenario = definition(
             [

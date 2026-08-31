@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import math
 import re
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
-from .errors import ConfigurationError, TransportError
+from .errors import ConfigurationError, ProbeTimeout, TransportError
 from .protocol import (
     JsonObject,
     ProtocolProfile,
@@ -21,7 +23,7 @@ from .protocol import (
     profile_for,
 )
 from .redaction import redact_command, redact_url
-from .transcript import EventRecorder
+from .transcript import EventRecorder, compact_json
 from .transports import (
     HttpExchange,
     HttpRpcResult,
@@ -37,6 +39,8 @@ PRIMITIVES: dict[str, tuple[str, str]] = {
     "resourceTemplates": ("resources/templates/list", "resourceTemplates"),
     "prompts": ("prompts/list", "prompts"),
 }
+MAX_PAGINATION_TOTAL_BYTES = 64 * 1024 * 1024
+MAX_PAGINATION_TOTAL_ITEMS = 100_000
 
 
 @dataclass
@@ -107,6 +111,11 @@ class McpSession:
             "prompts": [],
         }
         self.established = False
+        self._initialized_notification_sent = False
+        self._pagination_total_bytes = 0
+        self._pagination_total_items = 0
+        if isinstance(self.transport, StdioTransport):
+            self.transport.profile = self.profile
         self._install_server_request_handler()
 
     def start(self) -> None:
@@ -122,13 +131,23 @@ class McpSession:
             evidence = [response.evidence]
             if success:
                 result = response.payload["result"]
-                self.capabilities = _object_or_empty(result.get("capabilities"))
                 versions = result.get("supportedVersions")
+                success = (
+                    result.get("resultType") == "complete"
+                    and isinstance(versions, list)
+                    and all(isinstance(item, str) for item in versions)
+                    and self.requested_version in versions
+                    and isinstance(result.get("capabilities"), dict)
+                    and _finite_nonnegative_number(result.get("ttlMs"))
+                    and result.get("cacheScope") in {"public", "private"}
+                )
                 if isinstance(versions, list):
                     self.supported_versions = [item for item in versions if isinstance(item, str)]
-                self.server_info = _modern_server_info(result)
-                self.negotiated_version = self.requested_version
-                self.established = True
+                if success:
+                    self.capabilities = _object_or_empty(result.get("capabilities"))
+                    self.server_info = _modern_server_info(result)
+                    self.negotiated_version = self.requested_version
+                    self.established = True
             return EstablishResult(
                 response,
                 success,
@@ -154,12 +173,23 @@ class McpSession:
         outcome = self.send_exact_request(initialize, timeout)
         response = outcome.response
         evidence = [response.evidence]
-        success = _is_result(response.payload)
+        result_success = _is_result(response.payload)
         selected = negotiated_version(response.payload, self.requested_version)
-        self.negotiated_version = selected
-        if isinstance(self.transport, HttpTransport):
-            self.transport.protocol_version = selected
-        if success:
+        selected_profile = _compatible_legacy_profile(selected, self.transport)
+        success = (
+            result_success
+            and isinstance(response.payload["result"].get("protocolVersion"), str)
+            and selected_profile is not None
+        )
+        self.negotiated_version = selected if success else None
+        if success and selected_profile is not None:
+            self.profile = selected_profile
+            if isinstance(self.transport, HttpTransport):
+                self.transport.profile = selected_profile
+                self.transport.protocol_version = selected
+            else:
+                self.transport.profile = selected_profile
+            self._install_server_request_handler()
             result = response.payload["result"]
             self.capabilities = _object_or_empty(result.get("capabilities"))
             self.server_info = _object_or_empty(result.get("serverInfo"))
@@ -168,6 +198,7 @@ class McpSession:
             if self.config.send_initialized:
                 notification = make_initialized_notification()
                 notification_evidence = self.send_notification(notification, timeout)
+                self._initialized_notification_sent = True
                 if notification_evidence:
                     evidence.append(notification_evidence)
         return EstablishResult(
@@ -203,7 +234,7 @@ class McpSession:
                 "Automatic request correlation requires a string or integer JSON-RPC id."
             )
         if isinstance(self.transport, StdioTransport):
-            self.transport.send_message(message)
+            self.transport.send_message(message, timeout)
             response = self.transport.wait_for_response(request_id, timeout)
             return RpcOutcome(response)
         exchange = self.transport.send_message(
@@ -213,6 +244,10 @@ class McpSession:
         )
         response = _matching_http_response(exchange, request_id)
         if response is None:
+            if exchange.timed_out:
+                raise ProbeTimeout(
+                    f"HTTP stream timed out waiting for response id={request_id!r}."
+                )
             raise TransportError(
                 f"HTTP exchange contained no response matching id={request_id!r}."
             )
@@ -221,14 +256,14 @@ class McpSession:
 
     def send_notification(self, message: JsonObject, timeout: float) -> str | None:
         if isinstance(self.transport, StdioTransport):
-            return self.transport.send_message(message)
+            return self.transport.send_message(message, timeout)
         exchange = self.transport.send_message(message, timeout)
         return exchange.messages[-1].evidence if exchange.messages else self.recorder.last_reference()
 
     def send_raw_object(self, message: JsonObject, timeout: float) -> RpcOutcome | HttpExchange | str:
         """Send a payload without adding MCP metadata or changing its ID."""
         if isinstance(self.transport, StdioTransport):
-            evidence = self.transport.send_message(message)
+            evidence = self.transport.send_message(message, timeout)
             request_id = message_id(message)
             if request_id is None:
                 return evidence
@@ -274,8 +309,35 @@ class McpSession:
             result = payload["result"]
             page_items = result.get(result_key)
             if isinstance(page_items, list):
+                page_bytes = len(compact_json(page_items).encode("utf-8"))
+                next_item_total = self._pagination_total_items + len(page_items)
+                next_byte_total = self._pagination_total_bytes + page_bytes
+                if (
+                    next_item_total > MAX_PAGINATION_TOTAL_ITEMS
+                    or next_byte_total > MAX_PAGINATION_TOTAL_BYTES
+                ):
+                    self.recorder.record(
+                        "probe",
+                        self.target_description()["transport"],
+                        classification="resource_limit",
+                        error=(
+                            "Cumulative pagination exceeded the session safety limit."
+                        ),
+                        sourceEvidence=response.evidence,
+                        maxItems=MAX_PAGINATION_TOTAL_ITEMS,
+                        maxBytes=MAX_PAGINATION_TOTAL_BYTES,
+                        attemptedItems=next_item_total,
+                        attemptedBytes=next_byte_total,
+                    )
+                    raise TransportError(
+                        "Cumulative pagination exceeded the session safety limit "
+                        f"({MAX_PAGINATION_TOTAL_ITEMS} items / "
+                        f"{MAX_PAGINATION_TOTAL_BYTES} bytes)."
+                    )
+                self._pagination_total_items = next_item_total
+                self._pagination_total_bytes = next_byte_total
                 items.extend(page_items)
-            if "nextCursor" not in result or result.get("nextCursor") is None:
+            if "nextCursor" not in result:
                 self.discovered[primitive] = items
                 return PaginationResult(
                     primitive, items, page_number, responses, cursors, True
@@ -345,7 +407,7 @@ class McpSession:
         return self.transport.next_id()
 
     def _install_server_request_handler(self) -> None:
-        if self.profile.modern:
+        if self.profile.modern and self.config.initialize_message is None:
             self.transport.server_request_handler = self._reject_modern_server_request
         else:
             self.transport.server_request_handler = self._handle_legacy_server_request
@@ -364,10 +426,54 @@ class McpSession:
         message = inbound.payload
         if not isinstance(message, dict):
             return None
+        raw_request_id = message.get("id")
         request_id = message_id(message)
         method = message.get("method")
-        if request_id is None or not isinstance(method, str):
-            return None
+        params = message.get("params")
+        valid = (
+            message.get("jsonrpc") == "2.0"
+            and request_id is not None
+            and isinstance(method, str)
+            and method != ""
+            and "result" not in message
+            and "error" not in message
+            and ("params" not in message or isinstance(params, (dict, list)))
+        )
+        if not valid:
+            response_id: str | int | None = (
+                raw_request_id
+                if type(raw_request_id) is int or isinstance(raw_request_id, str)
+                else None
+            )
+            self.recorder.record(
+                "probe",
+                self.target_description()["transport"],
+                classification="invalid_server_request",
+                payload=message,
+                sourceEvidence=inbound.evidence,
+            )
+            return {
+                "jsonrpc": "2.0",
+                "id": response_id,
+                "error": {"code": -32600, "message": "Invalid Request"},
+            }
+        assert request_id is not None and isinstance(method, str)
+        if method != "ping" and not self._initialized_notification_sent:
+            self.recorder.record(
+                "probe",
+                self.target_description()["transport"],
+                classification="pre_initialized_server_request",
+                payload=message,
+                sourceEvidence=inbound.evidence,
+            )
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32002,
+                    "message": "MCP client is not initialized.",
+                },
+            }
         if method == "ping":
             return {"jsonrpc": "2.0", "id": request_id, "result": {}}
         if method == "roots/list" and "roots" in self.config.client_capabilities:
@@ -388,14 +494,12 @@ class McpSession:
     def _service_http_server_requests(self, exchange: HttpExchange, timeout: float) -> None:
         if not isinstance(self.transport, HttpTransport):
             return
-        for inbound in exchange.messages:
-            if inbound.classification != "request":
-                continue
-            handler = self.transport.server_request_handler
-            if handler:
-                response = handler(inbound)
-                if response is not None:
-                    self.transport.send_message(response, timeout)
+        self.transport._service_http_server_requests(
+            exchange.messages,
+            time.monotonic() + max(0.0, timeout),
+            0,
+            grouped=False,
+        )
 
     def _derived_headers(self, message: JsonObject) -> dict[str, str]:
         if not self.profile.modern or not isinstance(self.transport, HttpTransport):
@@ -434,6 +538,15 @@ def _is_result(payload: Any) -> bool:
     return isinstance(payload, dict) and isinstance(payload.get("result"), dict)
 
 
+def _finite_nonnegative_number(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
 def _object_or_empty(value: Any) -> JsonObject:
     return deepcopy(value) if isinstance(value, dict) else {}
 
@@ -443,6 +556,21 @@ def _modern_server_info(result: JsonObject) -> JsonObject:
     if not isinstance(metadata, dict):
         return {}
     return _object_or_empty(metadata.get("io.modelcontextprotocol/serverInfo"))
+
+
+def _compatible_legacy_profile(
+    selected: str,
+    transport: StdioTransport | HttpTransport,
+) -> ProtocolProfile | None:
+    try:
+        profile = profile_for(selected)
+    except ConfigurationError:
+        return None
+    if profile.modern:
+        return None
+    if isinstance(transport, HttpTransport) and not profile.streamable_http:
+        return None
+    return profile
 
 
 # RFC 9110 ``tchar``.  Colons, whitespace, and CR/LF are deliberately absent.
@@ -461,7 +589,7 @@ def _schema_argument_headers(schema: JsonObject, arguments: JsonObject) -> dict[
                 return
             if isinstance(value, bool):
                 rendered = "true" if value else "false"
-            elif type(value) is int:
+            elif type(value) is int and -(2**53 - 1) <= value <= 2**53 - 1:
                 rendered = str(value)
             elif isinstance(value, str):
                 rendered = value
