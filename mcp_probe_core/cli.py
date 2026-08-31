@@ -819,11 +819,22 @@ def _add_protocol_args(
             action="store_true",
             help="Do not send notifications/initialized in legacy protocol eras.",
         )
-    parser.add_argument("--timeout", type=float, default=15.0)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=15.0,
+        help=(
+            "Per-operation timeout in seconds (default: 15; a scenario file's "
+            "default applies when this option is omitted)."
+        ),
+    )
     parser.add_argument(
         "--transcript",
         metavar="PATH",
-        help="Write a redacted NDJSON protocol transcript.",
+        help=(
+            "Write a private redacted NDJSON transcript "
+            "(maximum 10,000 events / 64 MiB)."
+        ),
     )
     parser.add_argument(
         "--verbose",
@@ -860,7 +871,9 @@ def _add_transport_args(parser: argparse.ArgumentParser, transport: str) -> None
 def _add_output_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output", choices=OUTPUT_FORMATS, default="text")
     parser.add_argument(
-        "--report", metavar="PATH", help="Also write the machine-readable JSON report."
+        "--report",
+        metavar="PATH",
+        help="Also write a private machine-readable JSON report file.",
     )
 
 
@@ -914,7 +927,10 @@ def _add_laboratory_leaf(
     _add_output_args(parser)
     if command in {"check", "matrix"}:
         parser.add_argument(
-            "--max-pages", type=int, default=100, help="Pagination safety limit."
+            "--max-pages",
+            type=int,
+            default=100,
+            help="Pagination safety limit per primitive (default: 100; range: 1-1000).",
         )
     if command == "matrix":
         parser.add_argument(

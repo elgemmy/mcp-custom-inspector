@@ -4,6 +4,9 @@ The Everything server is a useful optional smoke target because it exposes
 tools, resources, and prompts. Installing or running it requires Node and npm;
 it is not part of the offline verification suite.
 
+The npm commands below track the package name. Pin an exact package version for
+a repeatable CI job.
+
 Inspect a known legacy profile:
 
 ```bash

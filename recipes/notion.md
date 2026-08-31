@@ -1,7 +1,12 @@
 # Notion
 
 The Notion server can be launched through npm. The commands below use a dummy
-token and stop at protocol initialization; they are not API tests.
+token and send only protocol initialization; they do not invoke a tool. The
+third-party server may still validate credentials during startup or
+initialization, so these are not Notion API safety guarantees.
+
+The npm commands below track the package name. Pin an exact package version for
+a repeatable CI job.
 
 Valid initialize with the initialized notification deliberately omitted:
 
@@ -28,5 +33,4 @@ python3 mcp_probe.py stdio \
 
 Do not put a real token in a recipe, transcript, report, shell-history example,
 or committed environment file. If you deliberately perform a live test, supply
-credentials only at run time. Probe will not call the Notion API unless you
-continue past initialization and invoke an operation that does so.
+credentials only at run time. These commands intentionally invoke no MCP tool.

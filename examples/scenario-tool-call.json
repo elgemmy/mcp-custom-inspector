@@ -1,0 +1,35 @@
+{
+  "schema": "mcp-probe.scenario/v1",
+  "name": "explicit-fixture-tool-call",
+  "description": "Demonstrate an active tool call that requires an exact CLI allow-list entry.",
+  "timeout": 5,
+  "actions": [
+    {
+      "action": "connect",
+      "establish": true
+    },
+    {
+      "action": "request",
+      "method": "tools/call",
+      "params": {
+        "name": "fixture_echo",
+        "arguments": {
+          "text": "reviewed fixture input"
+        }
+      }
+    },
+    {
+      "action": "expect",
+      "kind": "result",
+      "assertions": [
+        {
+          "path": "/result/isError",
+          "equals": false
+        }
+      ]
+    },
+    {
+      "action": "disconnect"
+    }
+  ]
+}

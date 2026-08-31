@@ -3,6 +3,9 @@
 The Memory server is useful for testing structured tool calls. Use a dedicated
 temporary graph file so an active test does not modify a real knowledge graph.
 
+The npm commands below track the package name. Pin an exact package version for
+a repeatable CI job.
+
 Run safe compatibility checks:
 
 ```bash

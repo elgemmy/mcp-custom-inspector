@@ -43,7 +43,7 @@ maps one profile onto another.
 | `2025-03-26` | `initialize`, then `notifications/initialized` | stdio and Streamable HTTP, including optional session behavior |
 | `2025-06-18` | `initialize`, then `notifications/initialized` | stdio and Streamable HTTP with the negotiated protocol-version header |
 | `2025-11-25` | `initialize`, then `notifications/initialized` | stdio and Streamable HTTP with the negotiated protocol-version header |
-| `2026-07-28` | stateless per-request metadata and `server/discover`; no initialize exchange | stdio and POST-only Streamable HTTP; no MCP sessions or independent server requests |
+| `2026-07-28` | stateless per-request metadata and `server/discover`; no initialize exchange | stdio and POST-only Streamable HTTP; no MCP sessions, server-to-client JSON-RPC requests, or client JSON-RPC responses |
 
 The current profile is `2026-07-28`. See the official
 [versioning rules](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning),
@@ -96,20 +96,53 @@ do not infer broad conformance from the overall status alone.
   complete JSON Schema validator and does not duplicate Inspector's portability
   linter.
 - Probe implements only the client-side server requests needed for targeted
-  protocol experiments. It is not a production sampling, elicitation, or roots
-  client.
+  legacy protocol experiments. It handles `ping`, advertised `roots/list`, and
+  explicit JSON-RPC errors for early, malformed, or unsupported requests; it is
+  not a production sampling, elicitation, or roots client. Under `2026-07-28`,
+  a server-to-client request is itself forbidden: Probe records the failure and
+  sends no JSON-RPC response.
+- The `2025-03-26` profile accepts bounded, non-empty structured JSON-RPC
+  batches over stdio and HTTP JSON/SSE. Probe records the envelope and each
+  item, correlates individual responses, and groups replies to batched legacy
+  server requests. The safe built-in suite does not synthesize a batch, so
+  `JSONRPC_BATCH_SUPPORT` is `SKIP` unless a batch is observed. `2025-06-18`
+  and later profiles reject batching.
 - Legacy HTTP+SSE from `2024-11-05`, OAuth flows, every historical transport,
   full resumability, and exhaustive content-semantic validation are outside the
   supported scope.
+- Legacy Streamable HTTP propagates an established session ID and tests session
+  termination (`2xx` or `405`). Probe does not automatically reinitialize and
+  retry after an expired-session `404`, including the recovery required by the
+  `2025-11-25` specification; it exposes that exchange as a transport or
+  compatibility failure.
 - The safe built-in suite does not inject method-specific invalid parameters,
   malformed request objects, duplicate initialization, or logging-level
   changes. Those require an explicit scenario so the exact input and expected
   outcome are reviewable.
 - Cancellation, progress, sampling, elicitation, and other client-side feature
-  semantics are not exhaustively exercised. Target-originated requests are
-  handled and recorded only within Probe's documented client subset.
+  semantics are not exhaustively exercised. In legacy profiles,
+  target-originated requests are handled and recorded only within Probe's
+  documented client subset. The modern profile records any such request as a
+  violation without replying.
 - Deliberately malformed stdio input can also violate the client's framing
   obligations. Robustness observations from such tests are not automatically
   classified as normative server failures.
 - External npm servers are optional smoke targets. The offline verification
   suite uses only local stdio and HTTP fixtures.
+
+## Deterministic resource bounds
+
+These are Probe safety limits, not protocol limits. A hard-cap breach is an
+operational or configuration failure and cannot produce an overall clean pass.
+
+- One stdio frame or inbound HTTP/SSE body: 8 MiB.
+- One structured JSON-RPC batch: 1,000 members.
+- Retained stdio input: 1,000 entries and 16 MiB.
+- One SSE response: 1,000 events, 10,000 lines, 100 parse issues, and an 8 MiB
+  maximum line/event-data field.
+- Pagination: 100 pages by default, configurable through 1,000, with 100,000
+  collected items and 64 MiB of cumulative decoded items per session.
+- Strict decoded JSON: maximum depth 100 and 100,000 nodes. A scenario file is
+  additionally limited to 1 MiB.
+- Transcript capture and loading: 10,000 events/physical lines and 64 MiB total;
+  see [transcript storage and limits](TRANSCRIPTS.md#storage-and-limits).

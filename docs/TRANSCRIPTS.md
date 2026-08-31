@@ -7,7 +7,8 @@ server crashes or the probe is interrupted and lets agents process large traces
 one event at a time.
 
 Use `--transcript PATH` on an inspection, compatibility check, matrix,
-scenario, or replay run. The file is replaced at the start of that run.
+scenario, or replay run. The file is securely created or truncated at the start
+of that run.
 
 ## Event model
 
@@ -16,7 +17,7 @@ Every event has these stable fields:
 | Field | Meaning |
 | --- | --- |
 | `schema` | `mcp-probe.transcript.event/v1` |
-| `seq` | Monotonic integer sequence within the run |
+| `seq` | Contiguous, 1-based integer sequence within the run |
 | `time` | UTC timestamp for human correlation |
 | `elapsedMs` | Relative monotonic time from recorder creation |
 | `direction` | Such as `client_to_server`, `server_to_client`, `server_stderr`, or `probe` |
@@ -37,6 +38,26 @@ Example shape (values abbreviated):
 ```json
 {"schema":"mcp-probe.transcript.event/v1","seq":4,"time":"2026-08-30T12:00:00.000+00:00","elapsedMs":8.417,"direction":"server_to_client","transport":"stdio","classification":"response","id":1,"payload":{"jsonrpc":"2.0","id":1,"result":{}}}
 ```
+
+## Storage and limits
+
+Probe retains at most 10,000 transcript events and 64 MiB of encoded evidence
+per run, in memory and on disk. Crossing either cap writes one `capture_limit`
+marker when space permits, becomes a transport failure (exit `3` for laboratory
+commands), and can never produce an overall clean pass.
+
+The transcript loader accepts at most 64 MiB, 10,000 physical lines, and 64 MiB
+for any one line. It requires strict UTF-8 JSON and contiguous event sequence
+numbers starting at 1. Structured values also use the global depth-100 and
+100,000-node JSON parser limits.
+
+On POSIX, transcript outputs are mode `0600`. Probe refuses a transcript target
+that is a symlink, hard link, FIFO, device, or other non-regular file. JSON
+reports use private atomic replacement and likewise reject linked or special
+targets. Parent-directory permissions remain the caller's responsibility.
+Transcript and report paths cannot be `-`, cannot name the same file, and cannot
+alias an input such as a replay transcript, scenario, initialize payload, or
+`--raw @file` source.
 
 ## Redaction policy
 

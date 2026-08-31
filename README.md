@@ -93,7 +93,7 @@ Stable process exit categories are:
 | `2` | Invalid configuration/scenario or blocked unsafe action |
 | `3` | Startup or transport failure prevented required execution |
 | `4` | Internal MCP Probe error |
-| `130` | Interrupted by the user |
+| `130` | Interrupted (Ctrl-C, SIGTERM, or SIGHUP) |
 
 This supports a tight agent/CI loop: run Probe, inspect finding evidence, fix
 the server, and rerun the same command. A minimal CI step needs only Python and
@@ -175,7 +175,10 @@ The supported subset covers JSON and SSE responses, multiple SSE events,
 protocol/method headers, legacy optional session propagation and termination,
 empty successful responses, error statuses, malformed bodies, content types,
 timeouts, and redacted authentication headers. It does not implement OAuth or
-legacy HTTP+SSE.
+legacy HTTP+SSE. Redirects are deliberately not followed, so credentials and
+session headers are not forwarded to another endpoint. For legacy Streamable
+HTTP, Probe surfaces an expired-session `404` but does not automatically
+reinitialize and retry the operation.
 
 ## Safety and redaction
 
@@ -191,6 +194,14 @@ legacy HTTP+SSE.
   to share. Never commit real credentials or private server responses.
 - Stdio children run in a managed process group and are cleaned up after normal
   completion, timeout, crash, configuration failure, and interruption.
+- On POSIX, catchable `SIGTERM` and `SIGHUP` follow the same cleanup path as
+  Ctrl-C. `SIGKILL` cannot be intercepted; Windows cleanup is limited to the
+  direct child because POSIX process-group signaling is unavailable there.
+- Wire input, queues, batches, SSE streams, pagination, structured JSON, and
+  retained evidence have deterministic resource caps. Crossing one is an
+  operational/configuration failure, never a clean compatibility pass. Exact
+  limits are listed in the [compatibility scope](docs/COMPATIBILITY-SCOPE.md)
+  and [transcript documentation](docs/TRANSCRIPTS.md).
 
 ## External smoke targets
 
@@ -198,7 +209,9 @@ The offline suite does not need npm. Optional commands for the Everything,
 Memory, Filesystem, and Notion servers are maintained under [recipes](recipes/).
 They use dummy credentials for handshake-only Notion probing and never commit
 server output. Package/network availability is environmental, so external
-smokes are not part of the local quality gate.
+smokes are not part of the local quality gate. See the latest
+[recorded smoke attempts](docs/SMOKE-RESULTS.md). The npm examples intentionally
+track the package names; pin exact package versions in a repeatable CI job.
 
 ## Repository map
 

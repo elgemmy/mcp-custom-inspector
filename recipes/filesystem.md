@@ -8,9 +8,11 @@ Prepare a safe test directory:
 
 ```bash
 mkdir -p /tmp/mcp-probe-fs
-printf 'hello from mcp probe
-' > /tmp/mcp-probe-fs/hello.txt
+printf '%s\n' 'hello from mcp probe' > /tmp/mcp-probe-fs/hello.txt
 ```
+
+The npm command below tracks the package name. Pin an exact package version for
+a repeatable CI job.
 
 Run non-mutating discovery and protocol checks:
 

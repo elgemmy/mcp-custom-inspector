@@ -63,6 +63,20 @@ for actions, in seconds; it defaults to `5`, must be positive, and cannot exceed
 object keys, unknown fields, and wrong JSON types are rejected before the target
 starts.
 
+All structured JSON paths reject duplicate object keys and non-finite numbers,
+and are limited to depth 100 and 100,000 decoded nodes. These are Probe safety
+limits rather than MCP assertions.
+
+`autoRespondServerRequests` defaults to `true`, which enables Probe's small
+legacy client handler for `ping`, advertised `roots/list`, malformed-request
+`-32600`, not-initialized `-32002`, and unsupported-method `-32601` responses.
+Set it to `false` when a legacy scenario must inspect a server request before
+choosing, delaying, or omitting the exact client response. In that mode, use an
+`exact` action with the server's request ID to send the response; Probe will not
+send a canned response first. In `2026-07-28`, server-to-client requests and
+client JSON-RPC responses are forbidden; Probe records the request as a failure
+and does not reply regardless of this setting.
+
 ## Actions
 
 | Action | Fields and behavior |
@@ -131,6 +145,13 @@ case-insensitive duplicates are rejected. `appendNewline` has no HTTP effect.
 Response status, body, parsing issues, and decoded events remain available as
 evidence.
 
+Strict JSON malformed bodies can hide an active `tools/call` from a simple
+allow-list check (for example through another character encoding or a
+permissive server parser). Probe therefore blocks opaque malformed wire by
+default. Add `--allow-opaque-wire` only after reviewing the target and exact
+bytes; the report records `SAFETY_OPAQUE_WIRE_OPT_IN`. Strictly decoded JSON
+tool calls still require the exact `--allow-tool NAME` independently.
+
 A malformed input experiment may itself violate a client's transport
 obligation. Record the observed robustness result, but do not label every
 disconnect or parse error from that experiment a normative server violation.
@@ -148,10 +169,10 @@ tool name on the command line:
 
 ```bash
 python3 mcp_probe.py scenario stdio \
-  --file tool-call.json \
+  --file examples/scenario-tool-call.json \
   --protocol-version 2025-06-18 \
-  --allow-tool get_fixture_status \
-  -- python3 fixture_server.py
+  --allow-tool fixture_echo \
+  -- python3 tests/fixtures/mcp_fixture.py stdio --profile stdio-good-legacy
 ```
 
 Repeat `--allow-tool NAME` for additional explicitly reviewed tools. Probe does
