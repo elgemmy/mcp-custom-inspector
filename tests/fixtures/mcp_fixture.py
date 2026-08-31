@@ -104,6 +104,7 @@ class FixtureConfig:
     mismatch_offset: int = 1000
     capability_mismatch_mode: str = "unadvertised"
     pagination_mode: str = "normal"
+    tool_schema_mode: str = "normal"
     http_error_status: int = 503
     empty_status: int = 202
     session_id: str = "fixture-session-id"
@@ -117,6 +118,14 @@ class FixtureConfig:
             raise ValueError("Fixture delays must be non-negative")
         if self.pagination_mode not in {"normal", "repeat", "loop", "malformed"}:
             raise ValueError(f"Unknown pagination mode: {self.pagination_mode}")
+        if self.tool_schema_mode not in {
+            "normal",
+            "missing-input",
+            "invalid-required",
+            "duplicate-names",
+            "bad-header",
+        }:
+            raise ValueError(f"Unknown tool schema mode: {self.tool_schema_mode}")
         if self.capability_mismatch_mode not in {"unadvertised", "unimplemented"}:
             raise ValueError(
                 f"Unknown capability mismatch mode: {self.capability_mismatch_mode}"
@@ -164,6 +173,15 @@ class FixtureEngine:
     def requires_initialized_notification(self) -> bool:
         return self.config.profile == "stdio-good-legacy"
 
+    @property
+    def modern(self) -> bool:
+        """Whether this fixture is serving the stateless 2026-07-28 era."""
+
+        return (
+            self.config.profile == "stdio-good-modern"
+            or self.config.protocol_version == "2026-07-28"
+        )
+
     def handle(self, message: Any) -> list[JsonObject]:
         self.state.record_message(message)
         if not isinstance(message, dict):
@@ -190,6 +208,29 @@ class FixtureEngine:
     def _handle_request(self, message: JsonObject) -> list[JsonObject]:
         method = str(message["method"])
         request_id = message.get("id")
+
+        if method == "server/discover":
+            if not self.modern:
+                return [self._error(request_id, -32601, "Method not found: server/discover")]
+            self.state.initialized = True
+            return [
+                self._result(
+                    request_id,
+                    {
+                        "resultType": "serverDiscovery",
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": default_capabilities(),
+                        "ttlMs": 1_000,
+                        "cacheScope": "private",
+                        "_meta": {
+                            "io.modelcontextprotocol/serverInfo": {
+                                "name": self.config.profile,
+                                "version": "1.0.0",
+                            }
+                        },
+                    },
+                )
+            ]
 
         if method == "initialize":
             self.state.initialized = True
@@ -219,7 +260,14 @@ class FixtureEngine:
                 and self.config.capability_mismatch_mode == "unimplemented"
             ):
                 return [self._error(request_id, -32601, "Method not found: tools/list")]
-            return [self._result(request_id, self._tools_page(message.get("params")))]
+            return [
+                self._result(
+                    request_id,
+                    self._modern_result(
+                        self._tools_page(message.get("params")), "toolsList"
+                    ),
+                )
+            ]
         if method == "tools/call":
             params = message.get("params") if isinstance(message.get("params"), dict) else {}
             name = params.get("name")
@@ -241,11 +289,35 @@ class FixtureEngine:
                 )
             ]
         if method == "resources/list":
-            return [self._result(request_id, {"resources": []})]
+            return [
+                self._result(
+                    request_id,
+                    self._modern_result({"resources": []}, "resourcesList"),
+                )
+            ]
+        if method == "resources/templates/list":
+            return [
+                self._result(
+                    request_id,
+                    self._modern_result(
+                        {"resourceTemplates": []}, "resourceTemplatesList"
+                    ),
+                )
+            ]
         if method == "prompts/list":
-            return [self._result(request_id, {"prompts": []})]
+            return [
+                self._result(
+                    request_id,
+                    self._modern_result({"prompts": []}, "promptsList"),
+                )
+            ]
 
         return [self._error(request_id, -32601, f"Method not found: {method}")]
+
+    def _modern_result(self, result: JsonObject, result_type: str) -> JsonObject:
+        if self.modern:
+            return {"resultType": result_type, **result}
+        return result
 
     def _handle_client_response(self, message: JsonObject) -> list[JsonObject]:
         if message.get("id") == self.SERVER_REQUEST_ID and self.state.pending_initialize is not None:
@@ -286,7 +358,16 @@ class FixtureEngine:
     def _tools_page(self, params: Any) -> JsonObject:
         cursor = params.get("cursor") if isinstance(params, dict) else None
         if self.config.profile != "stdio-pagination":
-            return {"tools": [fixture_tool("fixture_echo")]}
+            tools = [fixture_tool("fixture_echo")]
+            if self.config.tool_schema_mode == "missing-input":
+                tools[0].pop("inputSchema")
+            elif self.config.tool_schema_mode == "invalid-required":
+                tools[0]["inputSchema"]["required"] = "text"
+            elif self.config.tool_schema_mode == "duplicate-names":
+                tools.append(fixture_tool("fixture_echo"))
+            elif self.config.tool_schema_mode == "bad-header":
+                tools[0]["inputSchema"]["properties"]["text"]["x-mcp-header"] = "bad header"
+            return {"tools": tools}
 
         if cursor is None:
             next_cursor: Any = "page-2"
@@ -474,6 +555,14 @@ class FixtureHttpHandler(BaseHTTPRequestHandler):
             self._send_bytes(202, b"", None, extra_headers)
             return
 
+        response_status = 200
+        if (
+            self.server.engine.modern
+            and isinstance(responses[0].get("error"), dict)
+            and responses[0]["error"].get("code") == -32601
+        ):
+            response_status = 404
+
         profile = self.server.config.profile
         if profile in {"http-sse", "http-sse-multi"}:
             messages = responses
@@ -486,12 +575,17 @@ class FixtureHttpHandler(BaseHTTPRequestHandler):
                     },
                     *responses,
                 ]
-            self._send_bytes(200, self._encode_sse(messages), "text/event-stream", extra_headers)
+            self._send_bytes(
+                response_status,
+                self._encode_sse(messages),
+                "text/event-stream",
+                extra_headers,
+            )
             return
 
         content_type = "text/plain" if profile == "http-wrong-content-type" else "application/json"
         self._send_bytes(
-            200,
+            response_status,
             compact_json(responses[0]).encode("utf-8"),
             content_type,
             extra_headers,
@@ -623,6 +717,7 @@ def _config_from_args(args: argparse.Namespace) -> FixtureConfig:
         mismatch_offset=args.mismatch_offset,
         capability_mismatch_mode=args.capability_mismatch_mode,
         pagination_mode=args.pagination_mode,
+        tool_schema_mode=args.tool_schema_mode,
         http_error_status=args.http_error_status,
         empty_status=args.empty_status,
         session_id=args.session_id,
@@ -646,6 +741,17 @@ def _add_config_args(parser: argparse.ArgumentParser, profiles: tuple[str, ...])
     parser.add_argument(
         "--pagination-mode",
         choices=["normal", "repeat", "loop", "malformed"],
+        default="normal",
+    )
+    parser.add_argument(
+        "--tool-schema-mode",
+        choices=[
+            "normal",
+            "missing-input",
+            "invalid-required",
+            "duplicate-names",
+            "bad-header",
+        ],
         default="normal",
     )
     parser.add_argument("--http-error-status", type=int, default=503)
