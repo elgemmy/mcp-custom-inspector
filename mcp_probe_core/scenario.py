@@ -20,11 +20,20 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .errors import ConfigurationError, ProbeTimeout, ProcessExited, TransportError
+from .io_safety import InputLimitError, read_utf8_limited
 from .protocol import make_notification
-from .redaction import redact_value
+from .protocol import strict_json_loads
+from .redaction import redact_headers, redact_raw, redact_value
 from .report import EvidenceRef, Finding, RunError
 from .session import McpSession, PaginationResult, RpcOutcome
-from .transports import HttpExchange, HttpTransport, InboundMessage, StdioTransport
+from .transports import (
+    CleanupResult,
+    HttpExchange,
+    HttpTransport,
+    InboundMessage,
+    StdioTransport,
+    validate_http_headers,
+)
 
 
 SCENARIO_SCHEMA = "mcp-probe.scenario/v1"
@@ -57,6 +66,7 @@ class ScenarioDefinition:
     actions: tuple[dict[str, Any], ...]
     timeout: float = DEFAULT_SCENARIO_TIMEOUT
     description: str | None = None
+    auto_respond_server_requests: bool = True
     schema: str = SCENARIO_SCHEMA
 
 
@@ -76,23 +86,15 @@ def load_scenario(path: str | Path) -> ScenarioDefinition:
 
     scenario_path = Path(path)
     try:
-        size = scenario_path.stat().st_size
-    except OSError as exc:
-        raise ConfigurationError(f"Could not read scenario {scenario_path}: {exc}") from exc
-    if size > MAX_SCENARIO_BYTES:
-        raise ConfigurationError(
-            f"Scenario exceeds the {MAX_SCENARIO_BYTES}-byte safety limit: {scenario_path}"
+        text = read_utf8_limited(
+            scenario_path,
+            max_bytes=MAX_SCENARIO_BYTES,
+            label="Scenario",
         )
-    try:
-        text = scenario_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
+    except (OSError, UnicodeError, InputLimitError) as exc:
         raise ConfigurationError(f"Could not read scenario {scenario_path}: {exc}") from exc
     try:
-        value = json.loads(
-            text,
-            object_pairs_hook=_unique_object,
-            parse_constant=_reject_json_constant,
-        )
+        value = strict_json_loads(text)
     except (json.JSONDecodeError, ValueError) as exc:
         raise ConfigurationError(f"Invalid scenario JSON in {scenario_path}: {exc}") from exc
     return parse_scenario(value)
@@ -102,7 +104,18 @@ def parse_scenario(value: Any) -> ScenarioDefinition:
     """Validate an already decoded scenario and return a defensive copy."""
 
     root = _require_object(value, "scenario")
-    _only_keys(root, {"schema", "name", "description", "timeout", "actions"}, "scenario")
+    _only_keys(
+        root,
+        {
+            "schema",
+            "name",
+            "description",
+            "timeout",
+            "autoRespondServerRequests",
+            "actions",
+        },
+        "scenario",
+    )
     if root.get("schema") != SCENARIO_SCHEMA:
         raise _invalid(
             f"scenario.schema must be {SCENARIO_SCHEMA!r}; got {root.get('schema')!r}."
@@ -114,6 +127,9 @@ def parse_scenario(value: Any) -> ScenarioDefinition:
     if description is not None and not isinstance(description, str):
         raise _invalid("scenario.description must be a string or null.")
     timeout = _positive_number(root.get("timeout", DEFAULT_SCENARIO_TIMEOUT), "scenario.timeout")
+    auto_respond_server_requests = root.get("autoRespondServerRequests", True)
+    if not isinstance(auto_respond_server_requests, bool):
+        raise _invalid("scenario.autoRespondServerRequests must be a boolean.")
     raw_actions = root.get("actions")
     if not isinstance(raw_actions, list) or not raw_actions:
         raise _invalid("scenario.actions must be a non-empty array.")
@@ -139,6 +155,7 @@ def parse_scenario(value: Any) -> ScenarioDefinition:
         name=name.strip(),
         description=description,
         timeout=timeout,
+        auto_respond_server_requests=auto_respond_server_requests,
         actions=tuple(deepcopy(actions)),
     )
 
@@ -149,6 +166,7 @@ def run_scenario(
     *,
     timeout: float | None = None,
     allow_tools: set[str] | frozenset[str] | tuple[str, ...] = (),
+    allow_opaque_wire: bool = False,
 ) -> ScenarioRunResult:
     """Execute a scenario, applying explicit active-tool authorization.
 
@@ -166,11 +184,14 @@ def run_scenario(
     allowed = frozenset(allow_tools)
     if not all(isinstance(name, str) and name for name in allowed):
         raise ConfigurationError("Allowed tool names must be non-empty strings.")
+    if not isinstance(allow_opaque_wire, bool):
+        raise ConfigurationError("allow_opaque_wire must be a boolean.")
     return ScenarioRunner(
         session,
         scenario,
         default_timeout=default_timeout,
         allow_tools=allowed,
+        allow_opaque_wire=allow_opaque_wire,
     ).run()
 
 
@@ -184,11 +205,13 @@ class ScenarioRunner:
         *,
         default_timeout: float | None = None,
         allow_tools: frozenset[str] = frozenset(),
+        allow_opaque_wire: bool = False,
     ) -> None:
         self.session = session
         self.scenario = scenario
         self.default_timeout = default_timeout or scenario.timeout
         self.allow_tools = allow_tools
+        self.allow_opaque_wire = allow_opaque_wire
         self.findings: list[Finding] = []
         self.errors: list[RunError] = []
         self.values: list[Any] = []
@@ -202,11 +225,15 @@ class ScenarioRunner:
         self.last_fault_evidence: str | None = None
         self.last_action: str | None = None
         self.awaiting_observation = False
+        self.expected_close_observed = False
         self.server_requests: list[InboundMessage] = []
         self.consumed_server_request_evidence: set[str] = set()
 
     def run(self) -> ScenarioRunResult:
         started = time.monotonic()
+        original_handler = self.session.transport.server_request_handler
+        if not self.scenario.auto_respond_server_requests:
+            self.session.transport.server_request_handler = None
         try:
             # Connecting the transport is implicit.  An explicit start/connect
             # action remains useful when the scenario also wants an MCP-era
@@ -215,6 +242,7 @@ class ScenarioRunner:
         except TransportError as exc:
             self._add_transport_error(exc, during_start=True)
             self._disconnect(implicit=True)
+            self.session.transport.server_request_handler = original_handler
             return self._result(started)
 
         try:
@@ -253,6 +281,7 @@ class ScenarioRunner:
                 self._add_transport_error(self.last_fault)
             if not self.disconnected:
                 self._disconnect(implicit=True)
+            self.session.transport.server_request_handler = original_handler
         return self._result(started)
 
     def _result(self, started: float) -> ScenarioRunResult:
@@ -328,7 +357,7 @@ class ScenarioRunner:
             index,
             f"Sent request {action['method']}",
             evidence=evidence,
-            active=action["method"] == "tools/call",
+            active=_resembles_tools_call_method(action["method"]),
         )
 
     def _notification(self, index: int, action: dict[str, Any]) -> None:
@@ -363,20 +392,21 @@ class ScenarioRunner:
             index,
             f"Sent notification {action['method']}",
             evidence=_evidence(evidence_ref),
-            active=action["method"] == "tools/call",
+            active=_resembles_tools_call_method(action["method"]),
         )
 
     def _exact(self, index: int, action: dict[str, Any]) -> None:
         self._clear_observation()
         message = deepcopy(action["message"])
         method = message.get("method") if isinstance(message.get("method"), str) else None
-        params = message.get("params") if isinstance(message.get("params"), dict) else None
-        if not self._authorize_tool_call(index, method, params):
+        if not self._authorize_protocol_value(index, message):
             return
         try:
             transport = self.session.transport
             if isinstance(transport, StdioTransport):
-                evidence = transport.send_message(message)
+                evidence = transport.send_message(
+                    message, timeout=self._timeout(action)
+                )
                 self.awaiting_observation = True
                 if action["wait"]:
                     self._observe_response(self._timeout(action))
@@ -396,7 +426,7 @@ class ScenarioRunner:
             index,
             "Sent exact JSON-RPC object",
             evidence=_evidence(evidence),
-            active=method == "tools/call",
+            active=bool(_find_tool_call_objects(message)),
         )
 
     def _malformed(self, index: int, action: dict[str, Any]) -> None:
@@ -406,12 +436,47 @@ class ScenarioRunner:
             data = base64.b64decode(action["data"], validate=True)
         else:
             data = action["data"]
-        if not self._authorize_raw_tool_call(index, data):
+        content_encoding = next(
+            (
+                value
+                for key, value in action["headers"].items()
+                if key.lower() == "content-encoding"
+            ),
+            None,
+        )
+        opaque_transport_encoding = (
+            content_encoding is not None
+            and content_encoding.strip().lower() != "identity"
+        )
+        effective_content_type = next(
+            (
+                value
+                for key, value in action["headers"].items()
+                if key.lower() == "content-type"
+            ),
+            action["contentType"],
+        )
+        media_type, _, parameters = effective_content_type.partition(";")
+        safe_json_media = media_type.strip().lower() == "application/json"
+        if parameters:
+            normalized_parameters = parameters.strip().lower().replace(" ", "")
+            safe_json_media = safe_json_media and normalized_parameters in {
+                "charset=utf-8",
+                "charset=utf8",
+            }
+        force_opaque = opaque_transport_encoding or (
+            isinstance(self.session.transport, HttpTransport) and not safe_json_media
+        )
+        if not self._authorize_raw_tool_call(index, data, force_opaque=force_opaque):
             return
         try:
             transport = self.session.transport
             if isinstance(transport, StdioTransport):
-                evidence = transport.send_wire(data, append_newline=action["appendNewline"])
+                evidence = transport.send_wire(
+                    data,
+                    append_newline=action["appendNewline"],
+                    timeout=self._timeout(action),
+                )
                 if action["wait"]:
                     inbound = self._receive_stdio(self._timeout(action))
                     if inbound is not None:
@@ -525,6 +590,7 @@ class ScenarioRunner:
                 self.awaiting_observation = False
                 return
             if matched:
+                self.expected_close_observed = True
                 self.last_fault = None
                 self.last_fault_evidence = None
             elif isinstance(self.last_fault, ProbeTimeout):
@@ -619,7 +685,54 @@ class ScenarioRunner:
             status = "FAIL"
             details = str(exc)
         else:
-            if isinstance(result, int) and not 200 <= result < 300:
+            if isinstance(result, CleanupResult) and result.killed:
+                status = "FAIL"
+                details = (
+                    "Stdio target ignored graceful shutdown and SIGTERM; MCP Probe "
+                    "had to force termination with SIGKILL."
+                )
+                self.errors.append(
+                    RunError(
+                        code="TRANSPORT_STDIO_CHILD_EXIT",
+                        kind="transport",
+                        summary="Scenario target required forced process termination.",
+                        details=details,
+                        evidence=_evidence(
+                            self.session.recorder.last_reference() or evidence_before
+                        ),
+                    )
+                )
+            elif isinstance(result, CleanupResult) and result.terminated:
+                status = "WARN"
+                details = (
+                    "Stdio target did not exit after stdin closed; MCP Probe sent "
+                    "SIGTERM to prevent an orphan process."
+                )
+            elif (
+                isinstance(result, CleanupResult)
+                and result.returncode not in {None, 0}
+                and result.graceful
+                and not self.expected_close_observed
+            ):
+                status = "FAIL"
+                details = (
+                    f"Stdio target exited with non-zero status {result.returncode} "
+                    "during cleanup."
+                )
+                self.errors.append(
+                    RunError(
+                        code="TRANSPORT_STDIO_CHILD_EXIT",
+                        kind="transport",
+                        summary="Scenario target exited with a non-zero status.",
+                        details=details,
+                        evidence=_evidence(
+                            self.session.recorder.last_reference() or evidence_before
+                        ),
+                    )
+                )
+            elif isinstance(result, int) and not (
+                200 <= result < 300 or result == 405
+            ):
                 status = "FAIL"
                 details = f"HTTP session termination returned status {result}."
             else:
@@ -671,50 +784,72 @@ class ScenarioRunner:
         transport = self.session.transport
         if not isinstance(transport, StdioTransport):
             return
-        if transport.returncode is not None:
-            self._capture_fault(
-                ProcessExited(f"stdio server exited with code {transport.returncode}.")
-            )
-            return
-        self._receive_stdio(timeout)
+        deadline = time.monotonic() + timeout
+        while self.last_fault is None:
+            if transport.returncode is not None:
+                self._capture_fault(
+                    ProcessExited(f"stdio server exited with code {transport.returncode}.")
+                )
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._capture_fault(
+                    ProbeTimeout("Timed out waiting for the stdio connection to close.")
+                )
+                return
+            # Notifications and server requests can legitimately arrive before
+            # EOF.  They remain visible in the transcript, but do not consume a
+            # close expectation.
+            self._receive_stdio(remaining)
 
     def _find_server_request(self, method: str | None, timeout: float) -> InboundMessage | None:
-        candidates = list(self.server_requests)
-        if isinstance(self.session.transport, StdioTransport):
-            candidates.extend(self.session.transport.observed_server_requests())
-        if self.last_exchange:
-            candidates.extend(
-                message
-                for message in self.last_exchange.messages
-                if message.classification == "request"
-                and message.evidence not in self.consumed_server_request_evidence
+        transport = self.session.transport
+        deadline = time.monotonic() + timeout
+        while True:
+            candidates = list(self.server_requests)
+            if isinstance(transport, StdioTransport):
+                candidates.extend(transport.observed_server_requests())
+            if self.last_exchange:
+                candidates.extend(
+                    message
+                    for message in self.last_exchange.messages
+                    if message.classification == "request"
+                )
+            unique: dict[str, InboundMessage] = {
+                message.evidence: message
+                for message in candidates
+                if message.evidence not in self.consumed_server_request_evidence
+            }
+            candidates = list(unique.values())
+            found = next(
+                (item for item in candidates if _method_matches(item, method)), None
             )
-        candidates = [
-            message
-            for message in candidates
-            if message.evidence not in self.consumed_server_request_evidence
-        ]
-        found = next((item for item in candidates if _method_matches(item, method)), None)
-        if found is not None:
-            self.consumed_server_request_evidence.add(found.evidence)
-            self.server_requests = [item for item in candidates if item is not found]
-            return found
-        self.server_requests = candidates
-        if not isinstance(self.session.transport, StdioTransport):
-            return None
-        try:
-            inbound = self.session.transport.receive(timeout)
-        except TransportError as exc:
-            self._capture_fault(exc)
-            return None
-        self._remember_inbound(inbound)
-        if inbound.classification == "request" and _method_matches(inbound, method):
-            self.consumed_server_request_evidence.add(inbound.evidence)
-            self.server_requests = [
-                item for item in self.server_requests if item is not inbound
-            ]
-            return inbound
-        return None
+            if found is not None:
+                self.consumed_server_request_evidence.add(found.evidence)
+                self.server_requests = [
+                    item
+                    for item in candidates
+                    if item.evidence != found.evidence
+                ]
+                return found
+            self.server_requests = candidates
+            if not isinstance(transport, StdioTransport):
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._capture_fault(
+                    ProbeTimeout("Timed out waiting for a scenario server request.")
+                )
+                return None
+            try:
+                inbound = transport.receive(remaining)
+            except TransportError as exc:
+                self._capture_fault(exc)
+                return None
+            # An unrelated response or notification remains observable but does
+            # not consume the serverRequest expectation.  A request with a
+            # different method is retained for a later expectation.
+            self._remember_inbound(inbound)
 
     def _remember_rpc(self, outcome: RpcOutcome) -> None:
         self.last_response = outcome.response
@@ -729,7 +864,9 @@ class ScenarioRunner:
         self.last_response = responses[0] if responses else None
         self.pending_http_responses = responses[1:]
         self.last_value = (
-            self.last_response.payload if self.last_response else _exchange_value(exchange)
+            self.last_response.payload
+            if self.last_response
+            else _exchange_value(exchange, self.session.recorder)
         )
         self._store_value(self.last_value)
 
@@ -741,10 +878,13 @@ class ScenarioRunner:
         elif inbound.classification == "request":
             self.server_requests.append(inbound)
             handler = self.session.transport.server_request_handler
-            if handler:
+            if handler and not inbound.handled:
+                inbound.handled = True
                 response = handler(inbound)
                 if response is not None:
-                    self.session.transport.send_message(response)
+                    self.session.transport.send_message(
+                        response, timeout=self.default_timeout
+                    )
 
     def _evaluate_assertions(
         self,
@@ -818,7 +958,7 @@ class ScenarioRunner:
         method: str | None,
         params: Mapping[str, Any] | None,
     ) -> bool:
-        if method != "tools/call":
+        if not _resembles_tools_call_method(method):
             return True
         name = params.get("name") if isinstance(params, Mapping) else None
         if isinstance(name, str) and name in self.allow_tools:
@@ -849,7 +989,33 @@ class ScenarioRunner:
         )
         return False
 
-    def _authorize_raw_tool_call(self, index: int, data: str | bytes) -> bool:
+    def _authorize_protocol_value(self, index: int, value: Any) -> bool:
+        """Authorize every literal or nested tools/call-like object.
+
+        JSON-RPC only treats top-level batch members as messages, but safety is
+        intentionally conservative: permissive targets sometimes normalize
+        case/whitespace or recover nested malformed input.  Exact wire control
+        remains available after an exact per-tool opt-in.
+        """
+
+        calls = _find_tool_call_objects(value)
+        for call in calls:
+            params = call.get("params")
+            if not self._authorize_tool_call(
+                index,
+                str(call.get("method")),
+                params if isinstance(params, Mapping) else None,
+            ):
+                return False
+        return True
+
+    def _authorize_raw_tool_call(
+        self,
+        index: int,
+        data: str | bytes,
+        *,
+        force_opaque: bool = False,
+    ) -> bool:
         try:
             text = data.decode("utf-8", errors="strict") if isinstance(data, bytes) else data
         except UnicodeDecodeError:
@@ -857,16 +1023,11 @@ class ScenarioRunner:
             parsed: Any = _MISSING
         else:
             try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError:
+                parsed = strict_json_loads(text) if not force_opaque else _MISSING
+            except (json.JSONDecodeError, ValueError):
                 parsed = _MISSING
 
-        objects = parsed if isinstance(parsed, list) else [parsed]
-        calls = [
-            item
-            for item in objects
-            if isinstance(item, dict) and item.get("method") == "tools/call"
-        ]
+        calls = _find_tool_call_objects(parsed)
         if calls:
             names = [
                 item["params"].get("name")
@@ -889,7 +1050,7 @@ class ScenarioRunner:
                 assert isinstance(name, str)
                 self._authorize_tool_call(index, "tools/call", {"name": name})
             return True
-        if re.search(r"(?i)[\"']method[\"']\s*:\s*[\"']tools/call", text):
+        if _raw_resembles_tools_call(text):
             self.errors.append(
                 RunError(
                     code="CONFIG_UNSAFE_ACTION",
@@ -904,6 +1065,38 @@ class ScenarioRunner:
                 )
             )
             return False
+        if parsed is _MISSING:
+            if not self.allow_opaque_wire:
+                self.errors.append(
+                    RunError(
+                        code="CONFIG_UNSAFE_ACTION",
+                        kind="configuration",
+                        summary="Opaque malformed wire action requires a separate opt-in.",
+                        details=(
+                            f"Step {index} is not strict UTF-8 JSON in a directly inspectable "
+                            "application/json body. Pass --allow-opaque-wire only when the "
+                            "target and payload have been reviewed; a permissive server could "
+                            "interpret opaque input as an active tool call."
+                        ),
+                        evidence=_evidence(self.session.recorder.last_reference()),
+                    )
+                )
+                return False
+            self.findings.append(
+                Finding(
+                    code="SAFETY_OPAQUE_WIRE_OPT_IN",
+                    status="PASS",
+                    category="safety",
+                    basis="operational",
+                    summary=f"Step {index}: opaque malformed wire was explicitly allowed.",
+                    details=(
+                        "The payload could not be reduced to strict JSON for active-tool "
+                        "inspection; the user accepted that risk explicitly."
+                    ),
+                    evidence=_evidence(self.session.recorder.last_reference()),
+                    active=True,
+                )
+            )
         return True
 
     def _timeout(self, action: Mapping[str, Any]) -> float:
@@ -911,7 +1104,7 @@ class ScenarioRunner:
         return float(value)
 
     def _store_value(self, value: Any) -> None:
-        self.values.append(deepcopy(redact_value(value)))
+        self.values.append(deepcopy(self.session.recorder.redact_value(value)))
 
     def _capture_fault(self, exc: TransportError) -> None:
         self.last_fault = exc
@@ -1211,6 +1404,10 @@ def _http_headers(value: Any, context: str) -> dict[str, str]:
                 f"{context} contains duplicate case-insensitive header name {key!r}."
             )
         lowered.add(normalized)
+    try:
+        validate_http_headers(mapping)
+    except ConfigurationError as exc:
+        raise _invalid(f"{context}: {exc}") from exc
     return mapping
 
 
@@ -1305,12 +1502,12 @@ def _pagination_value(result: PaginationResult) -> dict[str, Any]:
     }
 
 
-def _exchange_value(exchange: HttpExchange) -> dict[str, Any]:
+def _exchange_value(exchange: HttpExchange, recorder: Any) -> dict[str, Any]:
     return {
         "httpStatus": exchange.status,
-        "headers": deepcopy(exchange.headers),
-        "body": exchange.body,
-        "parseIssues": list(exchange.parse_issues),
+        "headers": recorder.redact_headers(exchange.headers),
+        "body": recorder.redact_raw(exchange.body),
+        "parseIssues": [recorder.redact_text(item) for item in exchange.parse_issues],
         "timedOut": exchange.timed_out,
     }
 
@@ -1327,6 +1524,64 @@ def _method_matches(inbound: InboundMessage, method: str | None) -> bool:
     if method is None:
         return True
     return isinstance(inbound.payload, dict) and inbound.payload.get("method") == method
+
+
+def _resembles_tools_call_method(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().casefold() == "tools/call"
+
+
+def _find_tool_call_objects(value: Any) -> list[Mapping[str, Any]]:
+    """Recursively find tool-call-like objects in decoded wire data."""
+
+    found: list[Mapping[str, Any]] = []
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, Mapping):
+            if _resembles_tools_call_method(current.get("method")):
+                found.append(current)
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+    return found
+
+
+_JSON_STRING_TOKEN = re.compile(r'"(?:\\.|[^"\\])*"')
+
+
+def _raw_resembles_tools_call(text: str) -> bool:
+    """Detect a method/tools-call pair even when the whole wire is malformed.
+
+    Valid JSON is handled structurally before this fallback.  Here we decode
+    individual JSON string tokens so escaped spellings such as
+    ``tools\\u002fcall`` cannot bypass active-action authorization.
+    """
+
+    tokens: list[tuple[int, int, str]] = []
+    for match in _JSON_STRING_TOKEN.finditer(text):
+        try:
+            decoded = json.loads(match.group(0))
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(decoded, str):
+            tokens.append((match.start(), match.end(), decoded))
+    for index, (_start, end, key) in enumerate(tokens):
+        if key.strip().casefold() != "method":
+            continue
+        for value_start, _value_end, candidate in tokens[index + 1 :]:
+            between = text[end:value_start]
+            if ":" not in between:
+                continue
+            if _resembles_tools_call_method(candidate):
+                return True
+            break
+    # Also guard intentionally non-JSON single-quoted inputs.
+    return bool(
+        re.search(
+            r"(?is)['\"]\s*method\s*['\"]\s*:\s*['\"]\s*tools/call\s*['\"]",
+            text,
+        )
+    )
 
 
 def _evidence(*references: str | None) -> tuple[EvidenceRef, ...]:

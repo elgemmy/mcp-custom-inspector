@@ -22,15 +22,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .errors import ConfigurationError, ProbeTimeout, ProcessExited
-from .protocol import classify_message, message_method, modern_http_headers
+from .errors import ConfigurationError, ProbeTimeout, ProcessExited, TransportError
+from .protocol import (
+    classify_message,
+    message_method,
+    modern_http_headers,
+    profile_for,
+    strict_json_loads,
+)
 from .redaction import (
     REDACTED,
     contains_redaction,
-    redact_raw,
-    redact_value,
 )
-from .report import EvidenceRef, Finding
+from .report import EvidenceRef, Finding, RunError
 from .transcript import EventRecorder, compact_json, load_transcript
 from .transports import (
     HttpExchange,
@@ -46,12 +50,15 @@ _CLIENT_DIRECTIONS = {"client_to_server"}
 _SERVER_DIRECTIONS = {"server_to_client"}
 _MESSAGE_CLASSES = {"request", "response", "notification", "invalid"}
 _INBOUND_CLASSES = _MESSAGE_CLASSES | {
+    "blank_line",
     "invalid_body",
     "invalid_json",
     "invalid_utf8",
     "message_too_large",
+    "missing_delimiter",
 }
-_CLIENT_ACTION_CLASSES = _MESSAGE_CLASSES | {"raw_wire", "session_terminate"}
+_CLIENT_ACTION_CLASSES = _MESSAGE_CLASSES | {"batch", "raw_wire", "session_terminate"}
+_MAX_REPLAY_BATCH_MESSAGES = 1_000
 
 @dataclass(frozen=True, slots=True)
 class ReplayOptions:
@@ -70,6 +77,7 @@ class ReplayOptions:
     max_total_delay_seconds: float = 30.0
     max_events: int = 10_000
     allow_tools: tuple[str, ...] = ()
+    allow_opaque_wire: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -118,6 +126,8 @@ class ReplayOptions:
             if name not in normalized_tools:
                 normalized_tools.append(name)
         object.__setattr__(self, "allow_tools", tuple(normalized_tools))
+        if not isinstance(self.allow_opaque_wire, bool):
+            raise ConfigurationError("Replay allow_opaque_wire must be a boolean.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +140,7 @@ class ReplayPlan:
     events: tuple[Mapping[str, Any], ...]
     client_event_count: int
     active_tools: tuple[str, ...]
+    opaque_wire_event_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,7 +160,9 @@ class ReplayResult:
     credentials_reused: bool
     redactions_applied: bool
     active_tools: tuple[str, ...]
+    opaque_wire_event_count: int
     findings: tuple[Finding, ...] = field(default_factory=tuple)
+    errors: tuple[RunError, ...] = field(default_factory=tuple)
     evidence: tuple[str, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
@@ -167,6 +180,7 @@ class ReplayResult:
             "credentialsReused": self.credentials_reused,
             "redactionsApplied": self.redactions_applied,
             "activeTools": list(self.active_tools),
+            "opaqueWireEventCount": self.opaque_wire_event_count,
             "evidence": list(self.evidence),
             "findings": [finding.to_dict() for finding in self.findings],
         }
@@ -200,7 +214,11 @@ def load_replay_plan(
             f"Unsupported replay source transport: {source_transport!r}."
         )
     _validate_replay_events(events, source_transport)
-    active_tools = _validate_active_tool_actions(actions, replay_options.allow_tools)
+    active_tools, opaque_count = _validate_active_tool_actions(
+        actions,
+        replay_options.allow_tools,
+        allow_opaque_wire=replay_options.allow_opaque_wire,
+    )
     protocol_version = replay_options.protocol_version or _infer_protocol_version(actions)
     return ReplayPlan(
         source=str(Path(path)),
@@ -209,6 +227,7 @@ def load_replay_plan(
         events=tuple(events),
         client_event_count=len(actions),
         active_tools=active_tools,
+        opaque_wire_event_count=opaque_count,
     )
 
 
@@ -258,13 +277,18 @@ def replay_plan(
         raise ConfigurationError(
             "Replay options protocol version differs from the loaded replay plan."
         )
-    runtime_active_tools = _validate_active_tool_actions(
+    runtime_active_tools, runtime_opaque_count = _validate_active_tool_actions(
         [event for event in plan.events if _is_client_action(event)],
         replay_options.allow_tools,
+        allow_opaque_wire=replay_options.allow_opaque_wire,
     )
     if runtime_active_tools != plan.active_tools:
         raise ConfigurationError(
             "Replay plan active-tool metadata does not match its client actions."
+        )
+    if runtime_opaque_count != plan.opaque_wire_event_count:
+        raise ConfigurationError(
+            "Replay plan opaque-wire metadata does not match its client actions."
         )
     if isinstance(transport, HttpTransport):
         selected = replay_options.protocol_version or plan.protocol_version
@@ -286,12 +310,35 @@ def replay_plan(
     transport.server_request_handler = None
     try:
         if isinstance(transport, StdioTransport):
+            selected = replay_options.protocol_version or plan.protocol_version
+            if selected is not None:
+                # Stdio batch decoding is profile-sensitive (2025-03 receives
+                # batches; 2025-06 and later reject them).  A fresh replay must
+                # configure that era before the reader thread starts.
+                transport.profile = profile_for(selected)
             transport.start()
             state = _replay_stdio(plan, transport, recorder, replay_options)
         else:
             state = _replay_http(plan, transport, recorder, replay_options)
     finally:
         transport.server_request_handler = previous_handler
+
+    if plan.opaque_wire_event_count:
+        state.findings.append(
+            Finding(
+                code="SAFETY_OPAQUE_WIRE_OPT_IN",
+                status="PASS",
+                category="safety",
+                basis="operational",
+                summary="Opaque transcript wire events were explicitly allowed for replay.",
+                details=(
+                    f"{plan.opaque_wire_event_count} raw event(s) could not be reduced "
+                    "to strict JSON for active-tool inspection."
+                ),
+                evidence=tuple(EvidenceRef(item) for item in state.evidence),
+                active=True,
+            )
+        )
 
     comparison_failures = any(finding.status == "FAIL" for finding in state.findings)
     matches = state.completed and not comparison_failures
@@ -363,6 +410,7 @@ def replay_plan(
         credentials_reused=False,
         redactions_applied=state.redactions_applied,
         active_tools=runtime_active_tools,
+        opaque_wire_event_count=runtime_opaque_count,
         findings=tuple(state.findings),
         evidence=tuple(state.evidence),
     )
@@ -390,7 +438,9 @@ def _replay_stdio(
     for event in plan.events:
         if _is_client_action(event):
             _apply_timing(event, state, options)
-            evidence, redacted = _send_stdio_action(event, transport)
+            evidence, redacted = _send_stdio_action(
+                event, transport, options.timeout
+            )
             state.sent_actions += 1
             state.redactions_applied = state.redactions_applied or redacted
             state.evidence.append(evidence)
@@ -508,21 +558,49 @@ def _replay_http(
 
 
 def _send_stdio_action(
-    event: Mapping[str, Any], transport: StdioTransport
+    event: Mapping[str, Any], transport: StdioTransport, timeout: float
 ) -> tuple[str, bool]:
     classification = event.get("classification")
     if classification == "session_terminate":
         raise ConfigurationError("session_terminate is not a valid stdio replay action.")
     if classification == "raw_wire":
-        raw, redacted = _safe_raw_wire(event)
+        raw, redacted = _safe_raw_wire(event, transport.recorder)
         append_newline = event.get("appendNewline", True)
         if not isinstance(append_newline, bool):
             raise ConfigurationError(
                 f"Raw stdio replay event {event.get('seq')} appendNewline must be boolean."
             )
-        return transport.send_wire(raw, append_newline=append_newline), redacted
-    payload, redacted = _safe_payload(event)
-    return transport.send_message(payload), redacted
+        return (
+            _stdio_send_wire(
+                transport,
+                raw,
+                append_newline=append_newline,
+                timeout=timeout,
+            ),
+            redacted,
+        )
+    payload, redacted = _safe_payload(event, transport.recorder)
+    return _stdio_send_message(transport, payload, timeout), redacted
+
+
+def _stdio_send_message(
+    transport: StdioTransport, payload: Any, timeout: float
+) -> str:
+    return transport.send_message(payload, timeout=timeout)
+
+
+def _stdio_send_wire(
+    transport: StdioTransport,
+    data: str | bytes,
+    *,
+    append_newline: bool,
+    timeout: float,
+) -> str:
+    return transport.send_wire(
+        data,
+        append_newline=append_newline,
+        timeout=timeout,
+    )
 
 
 def _send_http_action(
@@ -531,10 +609,10 @@ def _send_http_action(
     classification = event.get("classification")
     outbound_payload: Any = None
     if classification == "raw_wire":
-        raw, redacted = _safe_raw_wire(event)
+        raw, redacted = _safe_raw_wire(event, transport.recorder)
         try:
-            outbound_payload = json.loads(raw)
-        except json.JSONDecodeError:
+            outbound_payload = strict_json_loads(raw)
+        except (json.JSONDecodeError, ValueError):
             outbound_payload = None
         derived_headers = None
         if transport.profile.modern and isinstance(outbound_payload, dict):
@@ -548,7 +626,7 @@ def _send_http_action(
             headers=derived_headers,
         )
     else:
-        payload, redacted = _safe_payload(event)
+        payload, redacted = _safe_payload(event, transport.recorder)
         outbound_payload = payload
         exchange = transport.send_message(payload, timeout)
     _update_http_lifecycle(transport, outbound_payload, exchange)
@@ -574,20 +652,29 @@ def _update_http_lifecycle(
             break
     if matching is None or not isinstance(matching.payload.get("result"), dict):
         return
-    transport.initialized = True
     selected = matching.payload["result"].get("protocolVersion")
-    if isinstance(selected, str):
-        transport.protocol_version = selected
+    if not isinstance(selected, str):
+        raise TransportError("Initialize response omitted a string protocolVersion.")
+    try:
+        selected_profile = profile_for(selected)
+    except ConfigurationError as exc:
+        raise TransportError(
+            f"Initialize response selected unsupported protocol version {selected!r}."
+        ) from exc
+    if selected_profile.modern or not selected_profile.streamable_http:
+        raise TransportError(
+            f"Initialize response selected protocol version {selected!r}, which is not "
+            "compatible with replay's legacy Streamable HTTP lifecycle."
+        )
+    transport.profile = selected_profile
+    transport.protocol_version = selected
     if transport.profile.http_sessions and not transport.session_id:
         fresh_session = header_value(exchange.headers, "MCP-Session-Id")
         if fresh_session:
-            transport.session_id = fresh_session
-            transport.recorder.record(
-                "probe",
-                "http",
-                classification="session_assigned",
-                headers={"MCP-Session-Id": fresh_session},
+            transport.accept_session_id(
+                fresh_session, source_evidence=matching.evidence
             )
+    transport.initialized = True
 
 
 def _client_evidence_for_exchange(
@@ -646,13 +733,15 @@ def _recorded_http_messages(
     return observed
 
 
-def _safe_payload(event: Mapping[str, Any]) -> tuple[Any, bool]:
+def _safe_payload(
+    event: Mapping[str, Any], recorder: EventRecorder
+) -> tuple[Any, bool]:
     if "payload" not in event:
         raise ConfigurationError(
             f"Transcript event {event.get('seq')} has no payload to replay."
         )
     source = event["payload"]
-    safe = redact_value(source)
+    safe = recorder.redact_value(source)
     # Loading JSON already guarantees serializable types, but explicitly
     # validate to keep ReplayPlan callers honest.
     try:
@@ -664,13 +753,15 @@ def _safe_payload(event: Mapping[str, Any]) -> tuple[Any, bool]:
     return safe, safe != source or contains_redaction(safe)
 
 
-def _safe_raw_wire(event: Mapping[str, Any]) -> tuple[str, bool]:
+def _safe_raw_wire(
+    event: Mapping[str, Any], recorder: EventRecorder
+) -> tuple[str, bool]:
     raw = event.get("raw")
     if not isinstance(raw, str):
         raise ConfigurationError(
             f"Raw replay event {event.get('seq')} requires a string raw field."
         )
-    safe = redact_raw(raw)
+    safe = recorder.redact_raw(raw)
     return safe, safe != raw or REDACTED in safe
 
 
@@ -708,10 +799,10 @@ def _event_finding(event: Mapping[str, Any], evidence: str) -> Finding:
         raw = event.get("raw")
         if isinstance(raw, str):
             try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError:
+                payload = strict_json_loads(raw)
+            except (json.JSONDecodeError, ValueError):
                 payload = None
-    active = isinstance(payload, dict) and payload.get("method") == "tools/call"
+    active = bool(_find_tool_call_objects(payload))
     return Finding(
         code="REPLAY_EVENT",
         status="PASS",
@@ -993,10 +1084,32 @@ def _validate_replay_events(
                     raise ConfigurationError(
                         "session_terminate can only be replayed over HTTP."
                     )
+            elif classification == "batch":
+                payload = event.get("payload")
+                if not isinstance(payload, list) or not payload:
+                    raise ConfigurationError(
+                        f"Batch replay event {event.get('seq')} requires a non-empty "
+                        "JSON array payload."
+                    )
+                if len(payload) > _MAX_REPLAY_BATCH_MESSAGES:
+                    raise ConfigurationError(
+                        f"Batch replay event {event.get('seq')} has {len(payload)} "
+                        f"items; replay limit is {_MAX_REPLAY_BATCH_MESSAGES}."
+                    )
+                if any(not isinstance(item, dict) for item in payload):
+                    raise ConfigurationError(
+                        f"Batch replay event {event.get('seq')} must contain only "
+                        "JSON-RPC object members."
+                    )
             elif classification == "raw_wire":
                 if not isinstance(event.get("raw"), str):
                     raise ConfigurationError(
                         f"Raw replay event {event.get('seq')} requires a string raw field."
+                    )
+                if event.get("exactBytesRecorded") is False:
+                    raise ConfigurationError(
+                        f"Raw {source_transport} replay event {event.get('seq')} did not "
+                        "capture exact bytes and cannot be replayed faithfully."
                     )
                 if source_transport == "stdio":
                     append_newline = event.get("appendNewline", True)
@@ -1004,11 +1117,6 @@ def _validate_replay_events(
                         raise ConfigurationError(
                             f"Raw stdio replay event {event.get('seq')} appendNewline "
                             "must be boolean."
-                        )
-                    if event.get("exactBytesRecorded") is False:
-                        raise ConfigurationError(
-                            f"Raw stdio replay event {event.get('seq')} did not capture "
-                            "exact bytes and cannot be replayed faithfully."
                         )
                 elif source_transport == "http":
                     _source_content_type(event)
@@ -1032,49 +1140,111 @@ def _validate_replay_events(
 
 
 def _validate_active_tool_actions(
-    actions: Sequence[Mapping[str, Any]], allow_tools: Sequence[str]
-) -> tuple[str, ...]:
+    actions: Sequence[Mapping[str, Any]],
+    allow_tools: Sequence[str],
+    *,
+    allow_opaque_wire: bool,
+) -> tuple[tuple[str, ...], int]:
     """Require exact opt-in for every captured active tool invocation."""
 
     allowed = set(allow_tools)
     active: list[str] = []
+    opaque_count = 0
     for event in actions:
         payload: Any
         if event.get("classification") == "raw_wire":
             raw = event.get("raw")
             assert isinstance(raw, str)  # validated by _validate_replay_events
             try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError:
+                payload = strict_json_loads(raw)
+            except (json.JSONDecodeError, ValueError):
                 # An invalid raw object cannot execute as JSON-RPC, but block a
                 # recognizable tools/call token anyway: malformed-wire replay
                 # must never become an accidental active call after server-side
                 # recovery or normalization.
-                if re.search(r"(?i)[\"']method[\"']\s*:\s*[\"']tools/call", raw):
+                if _raw_resembles_tools_call(raw):
                     raise ConfigurationError(
                         f"Raw transcript event {event.get('seq')} resembles tools/call "
                         "but is not valid JSON, so an exact tool allow-list cannot be verified."
                     )
+                if not allow_opaque_wire:
+                    raise ConfigurationError(
+                        f"Raw transcript event {event.get('seq')} is not strict JSON, so "
+                        "MCP Probe cannot prove it is free of an active tools/call. Pass "
+                        "--allow-opaque-wire only after reviewing the exact event and target."
+                    )
+                opaque_count += 1
                 continue
         else:
             payload = event.get("payload")
-        if not isinstance(payload, dict) or payload.get("method") != "tools/call":
+        calls = _find_tool_call_objects(payload)
+        for call in calls:
+            params = call.get("params")
+            name = params.get("name") if isinstance(params, Mapping) else None
+            if not isinstance(name, str) or not name:
+                raise ConfigurationError(
+                    f"Transcript event {event.get('seq')} calls a tool without an exact "
+                    "string name; replay cannot authorize it safely."
+                )
+            if name not in allowed:
+                raise ConfigurationError(
+                    f"Replay would actively call tool {name!r} from transcript event "
+                    f"{event.get('seq')}. Explicitly allow that exact tool name to proceed."
+                )
+            if name not in active:
+                active.append(name)
+    return tuple(active), opaque_count
+
+
+def _resembles_tools_call_method(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().casefold() == "tools/call"
+
+
+def _find_tool_call_objects(value: Any) -> list[Mapping[str, Any]]:
+    """Conservatively find active-tool-like objects, including nested batches."""
+
+    found: list[Mapping[str, Any]] = []
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, Mapping):
+            if _resembles_tools_call_method(current.get("method")):
+                found.append(current)
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+    return found
+
+
+_JSON_STRING_TOKEN = re.compile(r'"(?:\\.|[^"\\])*"')
+
+
+def _raw_resembles_tools_call(text: str) -> bool:
+    """Recognize escaped/case/whitespace variants in malformed raw input."""
+
+    tokens: list[tuple[int, int, str]] = []
+    for match in _JSON_STRING_TOKEN.finditer(text):
+        try:
+            decoded = json.loads(match.group(0))
+        except (json.JSONDecodeError, ValueError):
             continue
-        params = payload.get("params")
-        name = params.get("name") if isinstance(params, dict) else None
-        if not isinstance(name, str) or not name:
-            raise ConfigurationError(
-                f"Transcript event {event.get('seq')} calls a tool without an exact "
-                "string name; replay cannot authorize it safely."
-            )
-        if name not in allowed:
-            raise ConfigurationError(
-                f"Replay would actively call tool {name!r} from transcript event "
-                f"{event.get('seq')}. Explicitly allow that exact tool name to proceed."
-            )
-        if name not in active:
-            active.append(name)
-    return tuple(active)
+        if isinstance(decoded, str):
+            tokens.append((match.start(), match.end(), decoded))
+    for index, (_start, end, key) in enumerate(tokens):
+        if key.strip().casefold() != "method":
+            continue
+        for value_start, _value_end, candidate in tokens[index + 1 :]:
+            if ":" not in text[end:value_start]:
+                continue
+            if _resembles_tools_call_method(candidate):
+                return True
+            break
+    return bool(
+        re.search(
+            r"(?is)['\"]\s*method\s*['\"]\s*:\s*['\"]\s*tools/call\s*['\"]",
+            text,
+        )
+    )
 
 
 def _infer_protocol_version(events: Sequence[Mapping[str, Any]]) -> str | None:
@@ -1084,23 +1254,25 @@ def _infer_protocol_version(events: Sequence[Mapping[str, Any]]) -> str | None:
             raw = event.get("raw")
             if isinstance(raw, str):
                 try:
-                    payload = json.loads(raw)
-                except json.JSONDecodeError:
+                    payload = strict_json_loads(raw)
+                except (json.JSONDecodeError, ValueError):
                     payload = None
-        if not isinstance(payload, dict):
-            continue
-        params = payload.get("params")
-        if not isinstance(params, dict):
-            continue
-        if payload.get("method") == "initialize":
-            version = params.get("protocolVersion")
-            if isinstance(version, str):
-                return version
-        meta = params.get("_meta")
-        if isinstance(meta, dict):
-            version = meta.get("io.modelcontextprotocol/protocolVersion")
-            if isinstance(version, str):
-                return version
+        messages = payload if isinstance(payload, list) else [payload]
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            params = message.get("params")
+            if not isinstance(params, dict):
+                continue
+            if message.get("method") == "initialize":
+                version = params.get("protocolVersion")
+                if isinstance(version, str):
+                    return version
+            meta = params.get("_meta")
+            if isinstance(meta, dict):
+                version = meta.get("io.modelcontextprotocol/protocolVersion")
+                if isinstance(version, str):
+                    return version
     return None
 
 
@@ -1117,8 +1289,8 @@ def _replayed_negotiated_version(
             raw = event.get("raw")
             if isinstance(raw, str):
                 try:
-                    payload = json.loads(raw)
-                except json.JSONDecodeError:
+                    payload = strict_json_loads(raw)
+                except (json.JSONDecodeError, ValueError):
                     payload = None
         if isinstance(payload, dict) and payload.get("method") == "initialize":
             initialize_id = payload.get("id")

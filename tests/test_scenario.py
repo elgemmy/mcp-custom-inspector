@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -36,10 +37,11 @@ def stdio_session(
     *,
     capabilities: dict | None = None,
     version: str = LEGACY_VERSION,
+    extra: tuple[str, ...] = (),
 ) -> tuple[McpSession, EventRecorder]:
     recorder = EventRecorder()
     transport = StdioTransport(
-        stdio_fixture_command(profile),
+        stdio_fixture_command(profile, *extra),
         {},
         recorder,
         shutdown_timeout=0.25,
@@ -72,6 +74,13 @@ class ScenarioValidationTests(unittest.TestCase):
         self.assertNotIn("timeout", scenario.actions[0])
         self.assertEqual(scenario.actions[1]["timeout"], 0.25)
         self.assertEqual(scenario.actions[2]["assertions"], [])
+        self.assertTrue(scenario.auto_respond_server_requests)
+
+    def test_server_request_auto_response_setting_is_strict_boolean(self) -> None:
+        scenario = definition([{"action": "start"}], autoRespondServerRequests=False)
+        self.assertFalse(scenario.auto_respond_server_requests)
+        with self.assertRaises(ConfigurationError):
+            definition([{"action": "start"}], autoRespondServerRequests="false")
 
     def test_unknown_fields_and_bad_order_are_rejected(self) -> None:
         cases = [
@@ -179,7 +188,7 @@ class StdioScenarioTests(unittest.TestCase):
                     "action": "expect",
                     "kind": "result",
                     "assertions": [
-                        {"path": "/result/resultType", "equals": "serverDiscovery"}
+                        {"path": "/result/resultType", "equals": "complete"}
                     ],
                 },
                 {"action": "request", "method": "tools/list", "params": {}},
@@ -187,7 +196,7 @@ class StdioScenarioTests(unittest.TestCase):
                     "action": "expect",
                     "kind": "result",
                     "assertions": [
-                        {"path": "/result/resultType", "equals": "toolsList"}
+                        {"path": "/result/resultType", "equals": "complete"}
                     ],
                 },
             ]
@@ -241,7 +250,7 @@ class StdioScenarioTests(unittest.TestCase):
             ]
         )
         try:
-            result = run_scenario(session, scenario)
+            result = run_scenario(session, scenario, allow_opaque_wire=True)
         finally:
             recorder.close()
 
@@ -252,6 +261,30 @@ class StdioScenarioTests(unittest.TestCase):
         self.assertGreaterEqual(
             sum(item.code == "SCENARIO_ASSERTION" for item in result.findings), 4
         )
+
+    def test_disconnect_reports_nonzero_stdio_cleanup_as_transport_failure(self) -> None:
+        session, recorder = stdio_session(extra=("--eof-exit-code", "31"))
+        scenario = definition(
+            [
+                {"action": "connect", "establish": True},
+                {"action": "expect", "kind": "result"},
+                {"action": "disconnect"},
+            ]
+        )
+        try:
+            result = run_scenario(session, scenario)
+        finally:
+            recorder.close()
+
+        self.assertEqual(
+            [error.code for error in result.errors],
+            ["TRANSPORT_STDIO_CHILD_EXIT"],
+        )
+        disconnect = next(
+            item for item in result.findings if item.code == "SCENARIO_DISCONNECT"
+        )
+        self.assertEqual(disconnect.status, "FAIL")
+        self.assertIn("31", disconnect.details or "")
 
     def test_exact_objects_and_malformed_wire_input(self) -> None:
         session, recorder = stdio_session()
@@ -285,7 +318,7 @@ class StdioScenarioTests(unittest.TestCase):
             ]
         )
         try:
-            result = run_scenario(session, scenario)
+            result = run_scenario(session, scenario, allow_opaque_wire=True)
             payloads = [event.get("payload") for event in recorder.events]
         finally:
             recorder.close()
@@ -391,6 +424,35 @@ class StdioScenarioTests(unittest.TestCase):
             "PASS",
         )
 
+    def test_close_expectation_skips_unrelated_notification_before_eof(self) -> None:
+        script = (
+            "import json,sys\n"
+            "sys.stdin.buffer.readline()\n"
+            "print(json.dumps({'jsonrpc':'2.0','method':'notifications/test'}), flush=True)\n"
+        )
+        recorder = EventRecorder()
+        transport = StdioTransport(
+            [sys.executable, "-c", script], {}, recorder, shutdown_timeout=0.1
+        )
+        session = McpSession(
+            transport, SessionConfig(protocol_version=LEGACY_VERSION), recorder
+        )
+        scenario = definition(
+            [
+                {"action": "notification", "method": "notifications/start"},
+                {"action": "expect", "kind": "close", "timeout": 1},
+            ]
+        )
+        try:
+            result = run_scenario(session, scenario)
+        finally:
+            recorder.close()
+        expectation = next(
+            item for item in result.findings if item.code == "SCENARIO_EXPECTATION"
+        )
+        self.assertEqual(expectation.status, "PASS")
+        self.assertEqual(result.errors, ())
+
     def test_server_request_can_be_expected_while_waiting_for_initialize(self) -> None:
         session, recorder = stdio_session(
             "stdio-server-request", capabilities={"roots": {"listChanged": False}}
@@ -415,6 +477,92 @@ class StdioScenarioTests(unittest.TestCase):
             item for item in result.findings if item.code == "SCENARIO_EXPECTATION"
         ]
         self.assertEqual([item.status for item in expectations], ["PASS", "PASS"])
+
+    def test_server_request_expectation_skips_unrelated_notification(self) -> None:
+        script = (
+            "import json,sys\n"
+            "sys.stdin.buffer.readline()\n"
+            "print(json.dumps({'jsonrpc':'2.0','method':'notifications/test'}), flush=True)\n"
+            "print(json.dumps({'jsonrpc':'2.0','id':'server-1','method':'roots/list','params':{}}), flush=True)\n"
+            "for _line in sys.stdin.buffer: pass\n"
+        )
+        recorder = EventRecorder()
+        transport = StdioTransport(
+            [sys.executable, "-c", script], {}, recorder, shutdown_timeout=0.1
+        )
+        session = McpSession(
+            transport, SessionConfig(protocol_version=LEGACY_VERSION), recorder
+        )
+        scenario = definition(
+            [
+                {"action": "notification", "method": "notifications/start"},
+                {
+                    "action": "expect",
+                    "kind": "serverRequest",
+                    "method": "roots/list",
+                    "timeout": 1,
+                },
+            ]
+        )
+        try:
+            result = run_scenario(session, scenario)
+        finally:
+            recorder.close()
+        expectation = next(
+            item for item in result.findings if item.code == "SCENARIO_EXPECTATION"
+        )
+        self.assertEqual(expectation.status, "PASS")
+        self.assertEqual(result.errors, ())
+
+    def test_server_request_auto_response_can_be_disabled_for_exact_control(self) -> None:
+        session, recorder = stdio_session(
+            "stdio-server-request", capabilities={"roots": {"listChanged": False}}
+        )
+        scenario = definition(
+            [
+                {
+                    "action": "exact",
+                    "message": {
+                        "jsonrpc": "2.0",
+                        "id": 7,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": LEGACY_VERSION,
+                            "capabilities": {"roots": {"listChanged": False}},
+                            "clientInfo": {"name": "scenario", "version": "1"},
+                        },
+                    },
+                },
+                {"action": "expect", "kind": "serverRequest", "method": "roots/list"},
+                {
+                    "action": "exact",
+                    "message": {
+                        "jsonrpc": "2.0",
+                        "id": "fixture-roots-request",
+                        "result": {"roots": []},
+                    },
+                },
+                {"action": "expect", "kind": "result"},
+            ],
+            autoRespondServerRequests=False,
+        )
+        try:
+            result = run_scenario(session, scenario)
+        finally:
+            recorder.close()
+        self.assertEqual(result.errors, ())
+        expectations = [
+            item for item in result.findings if item.code == "SCENARIO_EXPECTATION"
+        ]
+        self.assertEqual([item.status for item in expectations], ["PASS", "PASS"])
+        client_responses = [
+            event
+            for event in recorder.events
+            if event.get("direction") == "client_to_server"
+            and event.get("classification") == "response"
+            and event.get("id") == "fixture-roots-request"
+        ]
+        self.assertEqual(len(client_responses), 1)
 
     def test_active_tool_call_requires_exact_allow_list_entry(self) -> None:
         blocked_session, blocked_recorder = stdio_session()
@@ -514,6 +662,94 @@ class StdioScenarioTests(unittest.TestCase):
                 )
                 self.assertEqual(client_messages, [])
 
+    def test_raw_tool_safety_is_recursive_and_decodes_method_spelling(self) -> None:
+        cases = (
+            '[{"jsonrpc":"2.0","method":"notifications/test","params":{"nested":{"method":"tools/call","params":{"name":"fixture_echo"}}}}]',
+            '{"jsonrpc":"2.0","method":"  TOOLS\\u002fCALL  ","params":{"name":"fixture_echo"}}',
+            '{"jsonrpc":"2.0","method":"tools\\u002fcall","params":{"name":"fixture_echo"}',
+        )
+        for data in cases:
+            with self.subTest(data=data):
+                session, recorder = stdio_session()
+                try:
+                    result = run_scenario(
+                        session,
+                        definition([{"action": "malformed", "data": data}]),
+                    )
+                    sent = [
+                        event
+                        for event in recorder.events
+                        if event.get("direction") == "client_to_server"
+                    ]
+                finally:
+                    recorder.close()
+                self.assertEqual(
+                    [error.code for error in result.errors], ["CONFIG_UNSAFE_ACTION"]
+                )
+                self.assertEqual(sent, [])
+
+    def test_forced_cleanup_is_warn_for_sigterm_and_fail_for_sigkill(self) -> None:
+        for ignore_sigterm, expected_status in ((False, "WARN"), (True, "FAIL")):
+            with self.subTest(ignore_sigterm=ignore_sigterm):
+                signal_setup = (
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN)"
+                    if ignore_sigterm
+                    else "pass"
+                )
+                script = (
+                    "import json,signal,sys,time\n"
+                    f"{signal_setup}\n"
+                    "line=sys.stdin.buffer.readline()\n"
+                    "message=json.loads(line)\n"
+                    "print(json.dumps({'jsonrpc':'2.0','id':message.get('id'),'result':{}}), flush=True)\n"
+                    "for _line in sys.stdin.buffer: pass\n"
+                    "time.sleep(60)\n"
+                )
+                recorder = EventRecorder()
+                transport = StdioTransport(
+                    [sys.executable, "-c", script],
+                    {},
+                    recorder,
+                    shutdown_timeout=0.05,
+                )
+                session = McpSession(
+                    transport, SessionConfig(protocol_version=LEGACY_VERSION), recorder
+                )
+                scenario = definition(
+                    [
+                        {
+                            "action": "exact",
+                            "message": {
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "method": "ping",
+                            },
+                            "wait": True,
+                        },
+                        {"action": "expect", "kind": "result"},
+                        {"action": "disconnect"},
+                    ]
+                )
+                try:
+                    result = run_scenario(session, scenario, timeout=1)
+                finally:
+                    recorder.close()
+                disconnect = next(
+                    item
+                    for item in result.findings
+                    if item.code == "SCENARIO_DISCONNECT"
+                )
+                self.assertEqual(disconnect.status, expected_status)
+                if ignore_sigterm:
+                    self.assertEqual(
+                        [error.code for error in result.errors],
+                        ["TRANSPORT_STDIO_CHILD_EXIT"],
+                    )
+                    self.assertIn("SIGKILL", disconnect.details or "")
+                else:
+                    self.assertEqual(result.errors, ())
+                    self.assertIn("SIGTERM", disconnect.details or "")
+
     def test_failed_field_assertion_is_a_compatibility_failure(self) -> None:
         session, recorder = stdio_session()
         scenario = definition(
@@ -557,7 +793,7 @@ class HttpScenarioTests(unittest.TestCase):
                 ]
             )
             try:
-                result = run_scenario(session, scenario)
+                result = run_scenario(session, scenario, allow_opaque_wire=True)
             finally:
                 recorder.close()
             self.assertEqual(
@@ -588,7 +824,7 @@ class HttpScenarioTests(unittest.TestCase):
                 ]
             )
             try:
-                result = run_scenario(session, scenario)
+                result = run_scenario(session, scenario, allow_opaque_wire=True)
             finally:
                 recorder.close()
             self.assertEqual(result.errors, ())

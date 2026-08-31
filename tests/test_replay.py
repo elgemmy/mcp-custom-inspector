@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -65,6 +66,102 @@ class ReplayTestCase(unittest.TestCase):
 
 
 class StdioReplayIntegrationTests(ReplayTestCase):
+    def test_structured_2025_03_batch_action_replays_as_one_wire_message(self) -> None:
+        batch = [
+            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        ]
+        responses = [result(1, {}), result(2, {"tools": []})]
+        source = self.manual_transcript(
+            [
+                {
+                    "direction": "client_to_server",
+                    "transport": "stdio",
+                    "payload": batch,
+                    "classification": "batch",
+                },
+                {
+                    "direction": "server_to_client",
+                    "transport": "stdio",
+                    "payload": responses,
+                    "classification": "batch",
+                },
+                {
+                    "direction": "server_to_client",
+                    "transport": "stdio",
+                    "payload": responses[0],
+                    "classification": "response",
+                },
+                {
+                    "direction": "server_to_client",
+                    "transport": "stdio",
+                    "payload": responses[1],
+                    "classification": "response",
+                },
+            ]
+        )
+        script = (
+            "import json,sys\n"
+            "messages=json.loads(sys.stdin.buffer.readline())\n"
+            "responses=[{'jsonrpc':'2.0','id':messages[0]['id'],'result':{}},"
+            "{'jsonrpc':'2.0','id':messages[1]['id'],'result':{'tools':[]}}]\n"
+            "print(json.dumps(responses,separators=(',',':')), flush=True)\n"
+            "for _line in sys.stdin.buffer: pass\n"
+        )
+        recorder = EventRecorder()
+        transport = StdioTransport([sys.executable, "-c", script], {}, recorder)
+        options = ReplayOptions(protocol_version="2025-03-26")
+        try:
+            replay = replay_transcript(source, transport, recorder, options)
+        finally:
+            transport.close()
+        self.assertTrue(replay.matches_source)
+        outgoing = [
+            event
+            for event in recorder.events
+            if event.get("direction") == "client_to_server"
+        ]
+        self.assertEqual(len(outgoing), 1)
+        self.assertEqual(outgoing[0]["classification"], "batch")
+        self.assertEqual(outgoing[0]["payload"], batch)
+
+    def test_destination_credentials_are_redacted_before_structured_replay_send(self) -> None:
+        secret = "destination-env-secret"
+        source = self.manual_transcript(
+            [
+                {
+                    "direction": "client_to_server",
+                    "transport": "stdio",
+                    "payload": {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/test",
+                        "params": {"echo": secret},
+                    },
+                    "classification": "notification",
+                }
+            ]
+        )
+        recorder = EventRecorder()
+        transport = StdioTransport(
+            stdio_fixture_command("stdio-good-modern"),
+            {"DESTINATION_TOKEN": secret},
+            recorder,
+        )
+        try:
+            replay = replay_transcript(source, transport, recorder)
+        finally:
+            transport.close()
+
+        self.assertTrue(replay.completed)
+        self.assertTrue(replay.redactions_applied)
+        sent = next(
+            event["payload"]
+            for event in recorder.events
+            if event.get("direction") == "client_to_server"
+        )
+        self.assertEqual(sent["params"]["echo"], "[REDACTED]")
+        self.assertNotIn(secret, json.dumps(recorder.events))
+
     def test_modern_stateless_replay_preserves_per_request_metadata_without_init(self) -> None:
         source_path = self.directory / "modern.ndjson"
         source_recorder = EventRecorder(str(source_path))
@@ -238,7 +335,12 @@ class StdioReplayIntegrationTests(ReplayTestCase):
         )
         installed_handler = transport.server_request_handler
         try:
-            replay = replay_transcript(source, transport, recorder)
+            replay = replay_transcript(
+                source,
+                transport,
+                recorder,
+                ReplayOptions(allow_opaque_wire=True),
+            )
         finally:
             transport.close()
 
@@ -308,7 +410,12 @@ class StdioReplayIntegrationTests(ReplayTestCase):
         recorder = EventRecorder()
         transport = self.stdio_transport("stdio-good-modern", recorder)
         try:
-            replay = replay_transcript(source, transport, recorder)
+            replay = replay_transcript(
+                source,
+                transport,
+                recorder,
+                ReplayOptions(allow_opaque_wire=True),
+            )
         finally:
             transport.close()
 
@@ -430,6 +537,41 @@ class StdioReplayIntegrationTests(ReplayTestCase):
         )
         self.assertEqual(plan.active_tools, ("fixture_echo",))
 
+    def test_batch_nested_and_normalized_tool_calls_require_exact_allow_list(self) -> None:
+        payload = [
+            {"jsonrpc": "2.0", "method": "notifications/test"},
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/wrapper",
+                "params": {
+                    "nested": {
+                        "method": "  TOOLS/CALL  ",
+                        "params": {"name": "fixture_echo"},
+                    }
+                },
+            },
+        ]
+        source = self.manual_transcript(
+            [
+                {
+                    "direction": "client_to_server",
+                    "transport": "stdio",
+                    "payload": payload,
+                    "classification": "batch",
+                }
+            ]
+        )
+        with self.assertRaisesRegex(ConfigurationError, "fixture_echo"):
+            load_replay_plan(source, ReplayOptions(protocol_version="2025-03-26"))
+        plan = load_replay_plan(
+            source,
+            ReplayOptions(
+                protocol_version="2025-03-26",
+                allow_tools=("fixture_echo",),
+            ),
+        )
+        self.assertEqual(plan.active_tools, ("fixture_echo",))
+
     def test_preserved_timing_is_individually_and_totally_bounded(self) -> None:
         source = self.manual_transcript(
             [
@@ -463,6 +605,7 @@ class StdioReplayIntegrationTests(ReplayTestCase):
             events=tuple(mutable),
             client_event_count=plan.client_event_count,
             active_tools=plan.active_tools,
+            opaque_wire_event_count=plan.opaque_wire_event_count,
         )
         recorder = EventRecorder()
         transport = self.stdio_transport("stdio-good-modern", recorder)
@@ -514,7 +657,10 @@ class HttpReplayIntegrationTests(ReplayTestCase):
                     source,
                     transport,
                     recorder,
-                    ReplayOptions(protocol_version=LEGACY_VERSION),
+                    ReplayOptions(
+                        protocol_version=LEGACY_VERSION,
+                        allow_opaque_wire=True,
+                    ),
                 )
                 captured = fixture.state.received_http[0]
             finally:

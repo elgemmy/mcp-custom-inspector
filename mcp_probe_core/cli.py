@@ -10,14 +10,18 @@ be translated to stable process exit codes at one boundary.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import math
 import os
 import re
+import signal
 import shlex
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Sequence
 from urllib.parse import urlsplit
@@ -30,7 +34,13 @@ from .errors import (
     ProbeError,
 )
 from .protocol import LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, profile_for
-from .redaction import redact_headers, redact_raw, redact_text, redact_value
+from .redaction import (
+    known_secrets_from_command,
+    redact_headers,
+    redact_raw,
+    redact_text,
+    redact_value,
+)
 from .session import McpSession, RpcOutcome, SessionConfig
 from .transcript import EventRecorder, pretty_json
 from .transports import HttpExchange, HttpTransport, StdioTransport
@@ -50,9 +60,14 @@ class _Runtime:
 class _ProbeArgumentParser(argparse.ArgumentParser):
     """Argparse with errors that use MCP Probe's configuration exit code."""
 
+    known_secrets: tuple[str, ...] = ()
+
     def error(self, message: str) -> None:
         self.print_usage(sys.stderr)
-        self.exit(EXIT_CONFIGURATION_ERROR, f"{self.prog}: error: {message}\n")
+        self.exit(
+            EXIT_CONFIGURATION_ERROR,
+            f"{self.prog}: error: {redact_text(message, self.known_secrets)}\n",
+        )
 
 
 def _read_json(text: str, *, label: str) -> Any:
@@ -214,33 +229,36 @@ def _runtime(
     return _Runtime(active_recorder, McpSession(transport, config, active_recorder))
 
 
-def _safe_http(exchange: HttpExchange) -> JsonObject:
+def _safe_http(exchange: HttpExchange, recorder: EventRecorder) -> JsonObject:
     return {
         "status": exchange.status,
-        "headers": redact_headers(exchange.headers),
-        "messages": [redact_value(message.payload) for message in exchange.messages],
-        "raw": redact_raw(exchange.body),
-        "parseIssues": [redact_text(issue) for issue in exchange.parse_issues],
+        "headers": recorder.redact_headers(exchange.headers),
+        "messages": [recorder.redact_value(message.payload) for message in exchange.messages],
+        "raw": recorder.redact_raw(exchange.body),
+        "parseIssues": [recorder.redact_text(issue) for issue in exchange.parse_issues],
         "timedOut": exchange.timed_out,
     }
 
 
-def _safe_outcome(value: Any) -> Any:
+def _safe_outcome(value: Any, recorder: EventRecorder) -> Any:
     if isinstance(value, RpcOutcome):
         if value.http_exchange is not None:
-            return _safe_http(value.http_exchange)
-        return redact_value(value.response.payload)
+            return _safe_http(value.http_exchange, recorder)
+        return recorder.redact_value(value.response.payload)
     if isinstance(value, HttpExchange):
-        return _safe_http(value)
-    return redact_value(value)
+        return _safe_http(value, recorder)
+    return recorder.redact_value(value)
 
 
-def _emit_inspection(records: list[tuple[str, Any]], output: str) -> None:
+def _emit_inspection(
+    records: list[tuple[str, Any]], output: str, recorder: EventRecorder
+) -> None:
     if output == "json":
         document = {
             "schema": "mcp-probe.inspection/v1",
             "records": [
-                {"label": label, "value": redact_value(value)} for label, value in records
+                {"label": recorder.redact_text(label), "value": recorder.redact_value(value)}
+                for label, value in records
             ],
         }
         print(json.dumps(document, ensure_ascii=False, indent=2))
@@ -248,37 +266,58 @@ def _emit_inspection(records: list[tuple[str, Any]], output: str) -> None:
     if output == "markdown":
         print("# MCP Probe inspection")
         for label, value in records:
-            print(f"\n## {label}\n")
+            print(f"\n## {recorder.redact_text(label)}\n")
             print("```json")
-            print(pretty_json(redact_value(value)))
+            print(pretty_json(recorder.redact_value(value)))
             print("```")
         return
     for label, value in records:
-        print(f"\n== {label} ==")
-        print(pretty_json(redact_value(value)))
+        print(f"\n== {recorder.redact_text(label)} ==")
+        print(pretty_json(recorder.redact_value(value)))
 
 
 def _inspection_document(records: list[tuple[str, Any]], runtime: _Runtime) -> JsonObject:
     return {
         "schema": "mcp-probe.inspection/v1",
-        "target": runtime.session.target_description(),
+        "target": _inspection_target(runtime),
         "protocol": {
             "requestedVersion": runtime.session.requested_version,
             "negotiatedVersion": runtime.session.negotiated_version,
             "era": runtime.session.profile.era,
         },
         "server": {
-            "serverInfo": redact_value(runtime.session.server_info),
-            "capabilities": redact_value(runtime.session.capabilities),
+            "serverInfo": runtime.recorder.redact_value(runtime.session.server_info),
+            "capabilities": runtime.recorder.redact_value(runtime.session.capabilities),
         },
         "records": [
-            {"label": label, "value": redact_value(value)} for label, value in records
+            {
+                "label": runtime.recorder.redact_text(label),
+                "value": runtime.recorder.redact_value(value),
+            }
+            for label, value in records
         ],
         "transcript": {
             "path": str(runtime.recorder.path) if runtime.recorder.path else None,
             "eventCount": len(runtime.recorder.events),
             "redacted": True,
         },
+    }
+
+
+def _inspection_target(runtime: _Runtime) -> JsonObject:
+    """Build a redacted target without applying secrets to control keys."""
+
+    transport = runtime.session.transport
+    if isinstance(transport, StdioTransport):
+        return {
+            "transport": "stdio",
+            "command": runtime.recorder.redact_command(transport.command),
+            "environmentKeys": sorted(transport.env),
+        }
+    return {
+        "transport": "http",
+        "url": runtime.recorder.redact_url(transport.url),
+        "headerNames": sorted(transport.extra_headers),
     }
 
 
@@ -295,20 +334,39 @@ def run_inspection(args: argparse.Namespace) -> int:
     try:
         established = runtime.session.establish(args.timeout)
         if established.http_exchange is not None:
-            init_value: Any = _safe_http(established.http_exchange)
+            init_value: Any = _safe_http(established.http_exchange, runtime.recorder)
         else:
-            init_value = redact_value(established.response.payload)
+            init_value = runtime.recorder.redact_value(established.response.payload)
         label = "server/discover" if runtime.session.profile.modern and not args.init_file and not args.init_json else "initialize"
         records.append((label, init_value))
 
-        if args.discover:
+        if args.discover and established.success:
             for method in ("tools/list", "resources/list", "prompts/list"):
                 try:
                     records.append(
-                        (method, _safe_outcome(runtime.session.rpc(method, {}, args.timeout)))
+                        (
+                            method,
+                            _safe_outcome(
+                                runtime.session.rpc(method, {}, args.timeout),
+                                runtime.recorder,
+                            ),
+                        )
                     )
                 except ProbeError as exc:
-                    records.append((method, {"error": redact_text(str(exc))}))
+                    records.append(
+                        (method, {"error": runtime.recorder.redact_text(str(exc))})
+                    )
+        elif args.discover:
+            for method in ("tools/list", "resources/list", "prompts/list"):
+                records.append(
+                    (
+                        method,
+                        {
+                            "skipped": True,
+                            "reason": "lifecycle establishment did not succeed",
+                        },
+                    )
+                )
 
         for raw in args.raw or ():
             message = _read_json(raw, label="--raw")
@@ -316,19 +374,19 @@ def run_inspection(args: argparse.Namespace) -> int:
                 raise ConfigurationError("--raw must be a JSON-RPC object.")
             outcome = runtime.session.send_raw_object(message, args.timeout)
             label = f"raw {message.get('method') or message.get('id')}"
-            records.append((label, _safe_outcome(outcome)))
+            records.append((label, _safe_outcome(outcome, runtime.recorder)))
 
         if args.interactive:
             if args.transport != "stdio":
                 raise ConfigurationError("--interactive is only available for stdio.")
-            _emit_inspection(records, args.output)
+            _emit_inspection(records, args.output, runtime.recorder)
             _interactive(runtime.session, args.timeout)
         runtime.session.close()
         inspection_closed = True
         if args.report:
             _write_json_file(args.report, _inspection_document(records, runtime))
         if not args.interactive:
-            _emit_inspection(records, args.output)
+            _emit_inspection(records, args.output, runtime.recorder)
         return EXIT_OK
     finally:
         if not inspection_closed:
@@ -358,7 +416,16 @@ def _interactive(session: McpSession, timeout: float) -> None:
                     raise ValueError("raw input must be a JSON object")
                 outcome = session.send_raw_object(message, timeout)
                 if "id" in message:
-                    _emit_inspection([(f"raw id={message['id']}", _safe_outcome(outcome))], "text")
+                    _emit_inspection(
+                        [
+                            (
+                                f"raw id={message['id']}",
+                                _safe_outcome(outcome, session.recorder),
+                            )
+                        ],
+                        "text",
+                        session.recorder,
+                    )
             elif line.startswith("notify "):
                 parts = shlex.split(line)
                 if len(parts) < 2:
@@ -373,9 +440,13 @@ def _interactive(session: McpSession, timeout: float) -> None:
                 parts = shlex.split(line)
                 params = json.loads(parts[1]) if len(parts) > 1 else {}
                 outcome = session.rpc(parts[0], params, timeout)
-                _emit_inspection([(parts[0], _safe_outcome(outcome))], "text")
+                _emit_inspection(
+                    [(parts[0], _safe_outcome(outcome, session.recorder))],
+                    "text",
+                    session.recorder,
+                )
         except (ProbeError, ValueError, json.JSONDecodeError) as exc:
-            print(f"error: {redact_text(str(exc))}", file=sys.stderr)
+            print(f"error: {session.recorder.redact_text(str(exc))}", file=sys.stderr)
 
 
 def _emit_report(report: Any, args: argparse.Namespace) -> int:
@@ -401,6 +472,8 @@ def _report_from_result(
     *,
     report_type: str,
     duration_ms: float | None = None,
+    operation: dict[str, Any] | None = None,
+    started_at: str,
 ) -> Any:
     """Wrap scenario/replay result records in the stable report envelope."""
     from .report import CompatibilityReport
@@ -419,6 +492,7 @@ def _report_from_result(
     return CompatibilityReport(
         report_type=report_type,
         target=runtime.session.target_description(),
+        started_at=started_at,
         duration_ms=measured_duration,
         requested_version=requested_version,
         negotiated_version=negotiated_version,
@@ -433,6 +507,9 @@ def _report_from_result(
             "eventCount": len(runtime.recorder.events),
             "redacted": True,
         },
+        scenario=operation if report_type == "scenario" else None,
+        replay=operation if report_type == "replay" else None,
+        known_secrets=runtime.recorder.known_secrets,
     )
 
 
@@ -465,6 +542,7 @@ def run_matrix_command(args: argparse.Namespace) -> int:
 
     # One recorder keeps evidence references unique across all matrix runs.
     recorder = EventRecorder(args.transcript, args.verbose)
+    started_at = dt.datetime.now(dt.UTC).isoformat(timespec="milliseconds")
     started = time.monotonic()
     run_reports: list[dict[str, Any]] = []
     target: dict[str, Any] | None = None
@@ -492,6 +570,7 @@ def run_matrix_command(args: argparse.Namespace) -> int:
         matrix = CompatibilityReport(
             report_type="matrix",
             target=target,
+            started_at=started_at,
             duration_ms=(time.monotonic() - started) * 1000,
             transcript={
                 "path": str(recorder.path) if recorder.path else None,
@@ -499,6 +578,7 @@ def run_matrix_command(args: argparse.Namespace) -> int:
                 "redacted": True,
             },
             matrix={"versions": versions, "runs": run_reports},
+            known_secrets=recorder.known_secrets,
         )
         return _emit_report(matrix, args)
     finally:
@@ -508,6 +588,7 @@ def run_matrix_command(args: argparse.Namespace) -> int:
 def run_scenario_command(args: argparse.Namespace) -> int:
     from .scenario import load_scenario, run_scenario
 
+    started_at = dt.datetime.now(dt.UTC).isoformat(timespec="milliseconds")
     scenario = load_scenario(args.file)
     runtime = _runtime(args)
     scenario_finished = False
@@ -517,9 +598,25 @@ def run_scenario_command(args: argparse.Namespace) -> int:
             scenario,
             timeout=args.timeout,
             allow_tools=set(args.allow_tool or ()),
+            allow_opaque_wire=args.allow_opaque_wire,
         )
         scenario_finished = True
-        report = _report_from_result(result, runtime, report_type="scenario")
+        report = _report_from_result(
+            result,
+            runtime,
+            report_type="scenario",
+            operation={
+                "schema": scenario.schema,
+                "name": scenario.name,
+                "description": scenario.description,
+                "source": str(Path(args.file)),
+                "actionCount": len(scenario.actions),
+                "completedActions": result.completed_actions,
+                "disconnected": result.disconnected,
+                "opaqueWireAllowed": args.allow_opaque_wire,
+            },
+            started_at=started_at,
+        )
         return _emit_report(report, args)
     finally:
         if not scenario_finished:
@@ -535,6 +632,7 @@ def run_replay_command(args: argparse.Namespace) -> int:
         replay_plan,
     )
 
+    started_at = dt.datetime.now(dt.UTC).isoformat(timespec="milliseconds")
     started = time.monotonic()
     ensure_distinct_transcript_paths(args.from_path, args.transcript)
     initial_options = ReplayOptions(
@@ -545,6 +643,7 @@ def run_replay_command(args: argparse.Namespace) -> int:
         max_delay_seconds=args.max_delay,
         max_total_delay_seconds=args.max_total_delay,
         allow_tools=tuple(args.allow_tool or ()),
+        allow_opaque_wire=args.allow_opaque_wire,
     )
     # Validate and infer the era before opening the target or the output
     # transcript.  Replay adds no lifecycle messages of its own.
@@ -561,6 +660,7 @@ def run_replay_command(args: argparse.Namespace) -> int:
             max_delay_seconds=args.max_delay,
             max_total_delay_seconds=args.max_total_delay,
             allow_tools=tuple(args.allow_tool or ()),
+            allow_opaque_wire=args.allow_opaque_wire,
         )
         result = replay_plan(
             plan,
@@ -570,13 +670,23 @@ def run_replay_command(args: argparse.Namespace) -> int:
         )
         # Replay owns no lifecycle cleanup.  Capture target shutdown evidence
         # before freezing the report while leaving the recorder open to emit it.
-        runtime.session.close()
+        cleanup = runtime.session.close()
         replay_closed = True
+        result = _apply_replay_cleanup(result, cleanup, runtime.recorder)
         report = _report_from_result(
             result,
             runtime,
             report_type="replay",
             duration_ms=(time.monotonic() - started) * 1000,
+            operation={
+                "source": plan.source,
+                **{
+                    key: value
+                    for key, value in result.to_dict().items()
+                    if key != "findings"
+                },
+            },
+            started_at=started_at,
         )
         return _emit_report(report, args)
     finally:
@@ -585,12 +695,98 @@ def run_replay_command(args: argparse.Namespace) -> int:
         runtime.recorder.close()
 
 
+def _apply_replay_cleanup(result: Any, cleanup: Any, recorder: EventRecorder) -> Any:
+    """Make forced or abnormal stdio cleanup visible in replay reports."""
+
+    from .report import EvidenceRef, Finding, RunError
+    from .transports import CleanupResult
+
+    if not isinstance(cleanup, CleanupResult):
+        return result
+    status: str | None = None
+    details: str | None = None
+    error_summary: str | None = None
+    if cleanup.killed:
+        status = "FAIL"
+        details = (
+            "The stdio child ignored stdin closure and SIGTERM, so MCP Probe "
+            "used SIGKILL during replay cleanup."
+        )
+        error_summary = "Replay target required forced process termination."
+    elif cleanup.terminated:
+        status = "WARN"
+        details = (
+            "The stdio child did not exit after stdin closed; MCP Probe sent "
+            "SIGTERM to prevent an orphan process."
+        )
+    elif cleanup.graceful and cleanup.returncode not in {None, 0}:
+        status = "FAIL"
+        details = (
+            f"The stdio child returned exit status {cleanup.returncode} after "
+            "the replay interaction."
+        )
+        error_summary = "Replay target exited with a non-zero status."
+    if status is None:
+        return result
+
+    evidence_name = recorder.last_reference()
+    evidence = (EvidenceRef(evidence_name),) if evidence_name is not None else ()
+    findings = tuple(
+        Finding(
+            code="REPLAY_COMPLETE",
+            status=status,
+            category="replay",
+            basis="operational",
+            summary=(
+                "Replay traffic matched, but target cleanup required SIGTERM."
+                if status == "WARN"
+                else "Replay protocol traffic completed, but target cleanup failed."
+            ),
+            details=details,
+            expected={
+                "sentActions": result.planned_actions,
+                "completed": True,
+                "responseComparisons": "all match",
+                "cleanup": "graceful exit 0",
+            },
+            actual={
+                "protocolMatch": result.matches_source,
+                "cleanupExitCode": cleanup.returncode,
+                "terminated": cleanup.terminated,
+                "killed": cleanup.killed,
+            },
+            evidence=evidence,
+        )
+        if finding.code == "REPLAY_COMPLETE"
+        else finding
+        for finding in result.findings
+    )
+    errors = result.errors
+    if error_summary is not None:
+        errors = errors + (
+            RunError(
+                code="TRANSPORT_STDIO_CHILD_EXIT",
+                kind="transport",
+                summary=error_summary,
+                details=details,
+                evidence=evidence,
+            ),
+        )
+    return replace(
+        result,
+        matches_source=result.matches_source if status == "WARN" else False,
+        findings=findings,
+        errors=errors,
+    )
+
+
 def _add_protocol_args(
     parser: argparse.ArgumentParser,
     *,
     default_version: str | None = LATEST_PROTOCOL_VERSION,
     include_client: bool = True,
     include_version: bool = True,
+    include_initialize_payload: bool = True,
 ) -> None:
     if include_version:
         parser.add_argument(
@@ -609,14 +805,15 @@ def _add_protocol_args(
             "--client-capabilities",
             help="JSON object for client capabilities. Defaults to {}.",
         )
-        parser.add_argument(
-            "--init-json",
-            help="Initialize params or a full JSON-RPC initialize request.",
-        )
-        parser.add_argument(
-            "--init-file",
-            help="File containing initialize params or a full initialize request.",
-        )
+        if include_initialize_payload:
+            parser.add_argument(
+                "--init-json",
+                help="Initialize params or a full JSON-RPC initialize request.",
+            )
+            parser.add_argument(
+                "--init-file",
+                help="File containing initialize params or a full initialize request.",
+            )
         parser.add_argument(
             "--no-initialized",
             action="store_true",
@@ -712,6 +909,7 @@ def _add_laboratory_leaf(
         default_version=None if command == "replay" else LATEST_PROTOCOL_VERSION,
         include_client=command != "replay",
         include_version=command != "matrix",
+        include_initialize_payload=command != "matrix",
     )
     _add_output_args(parser)
     if command in {"check", "matrix"}:
@@ -734,6 +932,14 @@ def _add_laboratory_leaf(
             "--allow-tool",
             action="append",
             help="Explicitly permit one tools/call target; repeat as needed.",
+        )
+        parser.add_argument(
+            "--allow-opaque-wire",
+            action="store_true",
+            help=(
+                "Permit malformed/non-UTF-8/transformed wire input that cannot be "
+                "inspected for hidden tools/call actions."
+            ),
         )
     if command == "replay":
         parser.add_argument(
@@ -766,6 +972,14 @@ def _add_laboratory_leaf(
             "--allow-tool",
             action="append",
             help="Explicitly permit a captured tools/call target; repeat as needed.",
+        )
+        parser.add_argument(
+            "--allow-opaque-wire",
+            action="store_true",
+            help=(
+                "Permit raw transcript events which are not strict JSON and cannot "
+                "be inspected for hidden tools/call actions."
+            ),
         )
     _add_transport_args(parser, transport)
     parser.set_defaults(func=func)
@@ -907,25 +1121,80 @@ def _validate_args(args: argparse.Namespace) -> None:
     _validate_io_paths(args)
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
+@contextmanager
+def _termination_signals_as_interrupts():
+    """Route catchable process-termination signals through normal cleanup."""
+
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    installed: list[tuple[int, Any]] = []
+
+    def interrupt(_signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt
+
     try:
-        args = parser.parse_args(argv)
-        _validate_args(args)
-        return int(args.func(args) or EXIT_OK)
+        for name in ("SIGTERM", "SIGHUP"):
+            signum = getattr(signal, name, None)
+            if signum is None:
+                continue
+            try:
+                previous = signal.signal(signum, interrupt)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            installed.append((signum, previous))
+        yield
+    finally:
+        for signum, previous in reversed(installed):
+            try:
+                signal.signal(signum, previous)
+            except (OSError, RuntimeError, ValueError):
+                pass
+
+
+def _set_parser_known_secrets(
+    parser: argparse.ArgumentParser, known_secrets: tuple[str, ...]
+) -> None:
+    """Install pre-parse credentials on every parser which may emit an error."""
+
+    if isinstance(parser, _ProbeArgumentParser):
+        parser.known_secrets = known_secrets
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for child in action.choices.values():
+                _set_parser_known_secrets(child, known_secrets)
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw_arguments = list(sys.argv[1:] if argv is None else argv)
+    known_secrets = tuple(known_secrets_from_command(raw_arguments))
+    parser = build_parser()
+    _set_parser_known_secrets(parser, known_secrets)
+    try:
+        with _termination_signals_as_interrupts():
+            args = parser.parse_args(raw_arguments)
+            _validate_args(args)
+            return int(args.func(args) or EXIT_OK)
     except KeyboardInterrupt:
         print("mcp-probe: interrupted", file=sys.stderr)
         return 130
     except ProbeError as exc:
-        print(f"mcp-probe: {redact_text(str(exc))}", file=sys.stderr)
+        print(
+            f"mcp-probe: {redact_text(str(exc), known_secrets)}", file=sys.stderr
+        )
         return int(exc.exit_code)
     except (OSError, json.JSONDecodeError) as exc:
-        print(f"mcp-probe: {redact_text(str(exc))}", file=sys.stderr)
+        print(
+            f"mcp-probe: {redact_text(str(exc), known_secrets)}", file=sys.stderr
+        )
         return EXIT_CONFIGURATION_ERROR
-    except SystemExit:
-        raise
+    except SystemExit as exc:
+        return int(exc.code) if isinstance(exc.code, int) else EXIT_CONFIGURATION_ERROR
     except Exception as exc:  # final CLI boundary: never expose a traceback by default
-        print(f"mcp-probe: internal error: {redact_text(str(exc))}", file=sys.stderr)
+        print(
+            f"mcp-probe: internal error: {redact_text(str(exc), known_secrets)}",
+            file=sys.stderr,
+        )
         return EXIT_INTERNAL_ERROR
 
 
