@@ -14,6 +14,7 @@ import math
 import os
 import re
 import shlex
+import stat
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -91,6 +92,8 @@ _FINDING_CODES_BY_CATEGORY: dict[str, tuple[str, ...]] = {
         "JSONRPC_INVALID_PARAMS",
         "JSONRPC_INVALID_REQUEST",
         "JSONRPC_NOTIFICATION_NO_RESPONSE",
+        "JSONRPC_BATCH_SUPPORT",
+        "JSONRPC_PROGRESS_TOKEN",
     ),
     "pagination": (
         "PAGINATION_CURSOR_SHAPE",
@@ -146,7 +149,7 @@ _FINDING_CODES_BY_CATEGORY: dict[str, tuple[str, ...]] = {
         "TOOL_X_MCP_HEADER_DUPLICATE",
         "TOOL_SCHEMA_INSPECTION",
     ),
-    "safety": ("SAFETY_ACTIVE_TOOL_OPT_IN",),
+    "safety": ("SAFETY_ACTIVE_TOOL_OPT_IN", "SAFETY_OPAQUE_WIRE_OPT_IN"),
     "scenario": (
         "SCENARIO_STEP",
         "SCENARIO_EXPECTATION",
@@ -227,6 +230,146 @@ def _safe_json(value: Any, parent_key: str | None = None) -> Any:
     if isinstance(redacted, (set, frozenset)):
         return [_safe_json(item) for item in sorted(redacted, key=repr)]
     return _safe_text(str(redacted))
+
+
+def _redact_report_untrusted(
+    report: dict[str, Any], known_secrets: Iterable[str]
+) -> dict[str, Any]:
+    """Apply per-run exact-secret redaction without corrupting the v1 schema.
+
+    The recorder may learn an arbitrary server-minted session identifier.  It
+    is therefore possible for a real secret to equal a report field name such
+    as ``transport``, ``event``, or even ``PASS``.  Report envelope keys and
+    generated evidence references are trusted control data and must remain
+    stable.  Server-owned JSON is the only place where keys are redacted as
+    well as values.
+    """
+
+    secrets = tuple(known_secrets)
+    if not secrets:
+        return report
+
+    def preserve_keys(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {str(key): preserve_keys(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [preserve_keys(item) for item in value]
+        if isinstance(value, tuple):
+            return [preserve_keys(item) for item in value]
+        return redact_value(value, known_secrets=secrets)
+
+    # Target and transcript structures are report-owned. Their untrusted
+    # values can contain credentials, but their keys and protocol-significant
+    # control values cannot be allowed to change because a server minted a
+    # colliding session id.
+    target = report.get("target")
+    if isinstance(target, Mapping):
+        safe_target = preserve_keys(target)
+        if isinstance(safe_target, dict) and target.get("transport") in {
+            "stdio",
+            "http",
+        }:
+            safe_target["transport"] = target["transport"]
+        report["target"] = safe_target
+    transcript = report.get("transcript")
+    if isinstance(transcript, Mapping):
+        report["transcript"] = {
+            "schema": transcript.get("schema"),
+            "path": redact_value(
+                transcript.get("path"), known_secrets=secrets
+            ),
+            "eventCount": transcript.get("eventCount"),
+            "redacted": transcript.get("redacted"),
+            **(
+                {
+                    "firstSeq": transcript.get("firstSeq"),
+                    "lastSeq": transcript.get("lastSeq"),
+                }
+                if "firstSeq" in transcript or "lastSeq" in transcript
+                else {}
+            ),
+        }
+
+    # Preserve the server/discovery envelopes while fully redacting the
+    # arbitrary server-owned JSON below them, including hostile secret keys.
+    server = report.get("server")
+    if isinstance(server, Mapping):
+        report["server"] = {
+            "serverInfo": redact_value(
+                server.get("serverInfo"), known_secrets=secrets
+            ),
+            "capabilities": redact_value(
+                server.get("capabilities"), known_secrets=secrets
+            ),
+        }
+    discovery = report.get("discovery")
+    if isinstance(discovery, Mapping):
+        report["discovery"] = {
+            str(key): redact_value(value, known_secrets=secrets)
+            for key, value in discovery.items()
+        }
+    for key in ("scenario", "replay"):
+        if key in report:
+            report[key] = preserve_keys(report[key])
+    for finding in report.get("findings", []):
+        for key in ("summary", "details"):
+            finding[key] = redact_value(finding.get(key), known_secrets=secrets)
+        for key in ("expected", "actual"):
+            finding[key] = redact_value(finding.get(key), known_secrets=secrets)
+        # Evidence event IDs and JSON Pointers are generated control data.
+        # Notes may contain server text and are redacted value-by-value.
+        evidence = finding.get("evidence")
+        if isinstance(evidence, list):
+            finding["evidence"] = [
+                {
+                    "event": item.get("event"),
+                    "pointer": item.get("pointer"),
+                    "note": redact_value(
+                        item.get("note"), known_secrets=secrets
+                    ),
+                }
+                if isinstance(item, Mapping)
+                else item
+                for item in evidence
+            ]
+    for error in report.get("errors", []):
+        for key in ("summary", "details"):
+            error[key] = redact_value(error.get(key), known_secrets=secrets)
+        evidence = error.get("evidence")
+        if isinstance(evidence, list):
+            error["evidence"] = [
+                {
+                    "event": item.get("event"),
+                    "pointer": item.get("pointer"),
+                    "note": redact_value(
+                        item.get("note"), known_secrets=secrets
+                    ),
+                }
+                if isinstance(item, Mapping)
+                else item
+                for item in evidence
+            ]
+
+    # Matrix children are complete v1 report envelopes. Apply the same
+    # collision-safe policy recursively so secrets learned by a later run are
+    # also removed from earlier child output without rewriting child status,
+    # finding codes, evidence references, or other control data.
+    matrix = report.get("matrix")
+    if isinstance(matrix, Mapping):
+        versions = matrix.get("versions", [])
+        runs = matrix.get("runs", [])
+        report["matrix"] = {
+            "versions": list(versions) if isinstance(versions, (list, tuple)) else [],
+            "runs": [
+                _redact_report_untrusted(dict(run), secrets)
+                if isinstance(run, Mapping)
+                else run
+                for run in runs
+            ]
+            if isinstance(runs, (list, tuple))
+            else [],
+        }
+    return report
 
 
 def _freeze(value: Any) -> Any:
@@ -498,12 +641,28 @@ def _normalize_transcript(transcript: Mapping[str, Any] | None) -> dict[str, Any
     event_count = transcript.get("eventCount", 0)
     if isinstance(event_count, bool) or not isinstance(event_count, int) or event_count < 0:
         raise ValueError("transcript.eventCount must be a non-negative integer.")
-    return {
+    normalized = {
         "schema": str(transcript.get("schema") or "mcp-probe.transcript.event/v1"),
         "path": _safe_text(str(transcript.get("path"))) if transcript.get("path") is not None else None,
         "eventCount": event_count,
         "redacted": bool(transcript.get("redacted", True)),
     }
+    for key in ("firstSeq", "lastSeq"):
+        if key not in transcript:
+            continue
+        sequence = transcript.get(key)
+        if sequence is not None and (
+            isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or sequence < 1
+        ):
+            raise ValueError(f"transcript.{key} must be a positive integer or null.")
+        normalized[key] = sequence
+    first = normalized.get("firstSeq")
+    last = normalized.get("lastSeq")
+    if first is not None and last is not None and first > last:
+        raise ValueError("transcript.firstSeq cannot be greater than transcript.lastSeq.")
+    return normalized
 
 
 def _finding_status(value: Finding | Mapping[str, Any]) -> str:
@@ -576,6 +735,11 @@ class CompatibilityReport:
     errors: tuple[RunError, ...] = field(default_factory=tuple)
     transcript: Mapping[str, Any] | None = None
     matrix: Mapping[str, Any] | None = None
+    scenario: Mapping[str, Any] | None = None
+    replay: Mapping[str, Any] | None = None
+    known_secrets: tuple[str, ...] = field(
+        default_factory=tuple, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if self.report_type not in REPORT_TYPES:
@@ -601,9 +765,27 @@ class CompatibilityReport:
             raise ValueError("Report errors must contain RunError objects.")
         if self.report_type == "matrix" and (findings or errors):
             raise ValueError("Matrix top-level findings and errors must remain empty.")
+        for field_name, value in (("scenario", self.scenario), ("replay", self.replay)):
+            if value is not None and not isinstance(value, Mapping):
+                raise ValueError(f"Report {field_name} metadata must be an object or null.")
+        if isinstance(self.known_secrets, (str, bytes)):
+            raise ValueError("Report known_secrets must be an iterable of strings.")
+        try:
+            known_secrets = tuple(self.known_secrets)
+        except TypeError as exc:
+            raise ValueError(
+                "Report known_secrets must be an iterable of strings."
+            ) from exc
+        if not all(isinstance(item, str) and item for item in known_secrets):
+            raise ValueError("Report known_secrets must contain non-empty strings.")
+        if self.scenario is not None and self.report_type != "scenario":
+            raise ValueError("Scenario metadata is only valid on a scenario report.")
+        if self.replay is not None and self.report_type != "replay":
+            raise ValueError("Replay metadata is only valid on a replay report.")
 
         object.__setattr__(self, "target", _freeze(_normalize_target(self.target)))
         object.__setattr__(self, "duration_ms", _round_duration(self.duration_ms))
+        object.__setattr__(self, "known_secrets", known_secrets)
         object.__setattr__(self, "started_at", _safe_text(self.started_at))
         object.__setattr__(self, "requested_version", _safe_json(self.requested_version))
         object.__setattr__(self, "negotiated_version", _safe_json(self.negotiated_version))
@@ -630,6 +812,16 @@ class CompatibilityReport:
             self,
             "matrix",
             _freeze(_safe_json(self.matrix)) if self.matrix is not None else None,
+        )
+        object.__setattr__(
+            self,
+            "scenario",
+            _freeze(_safe_json(self.scenario)) if self.scenario is not None else None,
+        )
+        object.__setattr__(
+            self,
+            "replay",
+            _freeze(_safe_json(self.replay)) if self.replay is not None else None,
         )
 
     @property
@@ -675,7 +867,11 @@ class CompatibilityReport:
                 "versions": [],
                 "runs": [],
             }
-        return _safe_json(report)
+        elif self.report_type == "scenario":
+            report["scenario"] = _thaw(self.scenario) if self.scenario is not None else {}
+        elif self.report_type == "replay":
+            report["replay"] = _thaw(self.replay) if self.replay is not None else {}
+        return _safe_json(_redact_report_untrusted(report, self.known_secrets))
 
     def render(self, output_format: str = "text") -> str:
         if output_format == "text":
@@ -745,12 +941,20 @@ def _derive_matrix_exit_code(matrix: Mapping[str, Any]) -> int:
         findings = run.get("findings", [])
         if not isinstance(errors, list) or not isinstance(findings, list):
             raise ValueError("Matrix run findings and errors must be arrays.")
-        kinds.update(_error_kind(error) for error in errors if isinstance(error, Mapping))
-        has_fail = has_fail or any(
-            _finding_status(finding) == "FAIL"
-            for finding in findings
-            if isinstance(finding, Mapping)
-        )
+        if not all(isinstance(error, Mapping) for error in errors):
+            raise ValueError("Each matrix run error must be an object.")
+        if not all(isinstance(finding, Mapping) for finding in findings):
+            raise ValueError("Each matrix run finding must be an object.")
+        for error in errors:
+            kind = _error_kind(error)
+            if kind not in ERROR_KINDS:
+                raise ValueError(f"Unknown matrix run error kind: {kind!r}")
+            kinds.add(kind)
+        for finding in findings:
+            status = _finding_status(finding)
+            if status not in FINDING_STATUSES:
+                raise ValueError(f"Unknown matrix run finding status: {status!r}")
+            has_fail = has_fail or status == "FAIL"
     if "internal" in kinds:
         return EXIT_INTERNAL_ERROR
     if "configuration" in kinds:
@@ -801,6 +1005,63 @@ def _event_refs(item: Mapping[str, Any]) -> str:
     return f" [{', '.join(refs)}]" if refs else ""
 
 
+def _renderable_matrix_runs(
+    data: Mapping[str, Any],
+) -> list[tuple[str, Mapping[str, Any]]]:
+    """Return matrix runs paired with an explicit display version.
+
+    Matrix reports intentionally keep their top-level protocol and findings
+    empty.  Human renderers therefore have to descend into ``matrix.runs``;
+    otherwise the most important compatibility differences disappear.
+    """
+
+    matrix = data.get("matrix")
+    if not isinstance(matrix, Mapping):
+        return []
+    raw_runs = matrix.get("runs", [])
+    raw_versions = matrix.get("versions", [])
+    if not isinstance(raw_runs, list):
+        return []
+    versions = raw_versions if isinstance(raw_versions, list) else []
+    result: list[tuple[str, Mapping[str, Any]]] = []
+    for index, run in enumerate(raw_runs):
+        if not isinstance(run, Mapping):
+            continue
+        requested = _protocol_value(run, "requestedVersion")
+        if requested == "n/a" and index < len(versions):
+            requested = str(versions[index])
+        result.append((requested, run))
+    return result
+
+
+def _summary_text(overall: Any) -> str:
+    safe_overall = overall if isinstance(overall, Mapping) else {}
+    counts = safe_overall.get("counts", {})
+    safe_counts = counts if isinstance(counts, Mapping) else {}
+    return (
+        ", ".join(f"{key.upper()} {safe_counts.get(key, 0)}" for key in _COUNT_KEYS)
+        + f", ERRORS {safe_overall.get('errorCount', 0)}"
+    )
+
+
+def _render_text_finding(lines: list[str], finding: Mapping[str, Any], *, indent: str = "") -> None:
+    lines.append(
+        f"{indent}{finding.get('status')} {finding.get('code')}  "
+        f"{finding.get('summary')}{_event_refs(finding)}"
+    )
+    if finding.get("status") in {"FAIL", "WARN", "SKIP"} and finding.get("details"):
+        lines.append(f"{indent}  {finding['details']}")
+
+
+def _render_text_error(lines: list[str], error: Mapping[str, Any], *, indent: str = "") -> None:
+    lines.append(
+        f"{indent}ERROR {error.get('code')}  "
+        f"{error.get('summary')}{_event_refs(error)}"
+    )
+    if error.get("details"):
+        lines.append(f"{indent}  {error['details']}")
+
+
 def render_text(report: CompatibilityReport | Mapping[str, Any]) -> str:
     data = _report_dict(report)
     overall = data.get("overall", {})
@@ -815,17 +1076,53 @@ def render_text(report: CompatibilityReport | Mapping[str, Any]) -> str:
             f"{_protocol_value(data, 'negotiatedVersion')}"
         ),
     ]
+    scenario = data.get("scenario")
+    if isinstance(scenario, Mapping):
+        lines.append(
+            f"Scenario: {scenario.get('name', 'unknown')} "
+            f"(source {scenario.get('source', 'unknown')})"
+        )
+        lines.append(
+            f"Actions: {scenario.get('completedActions', 0)}/"
+            f"{scenario.get('actionCount', 0)} completed"
+        )
+    replay = data.get("replay")
+    if isinstance(replay, Mapping):
+        lines.append(f"Replay source: {replay.get('source', 'unknown')}")
+        lines.append(
+            f"Replay actions: {replay.get('sentActions', 0)}/"
+            f"{replay.get('plannedActions', 0)} sent; "
+            f"matches source: {str(replay.get('matchesSource', False)).lower()}"
+        )
     server = data.get("server", {})
     if isinstance(server, Mapping) and server.get("serverInfo") is not None:
         lines.append(
             "Server: "
             + json.dumps(server["serverInfo"], ensure_ascii=False, separators=(",", ":"))
         )
-    lines.append(
-        "Summary: "
-        + ", ".join(f"{key.upper()} {counts.get(key, 0)}" for key in _COUNT_KEYS)
-        + f", ERRORS {overall.get('errorCount', 0) if isinstance(overall, Mapping) else 0}"
-    )
+    lines.append("Summary: " + _summary_text(overall))
+
+    matrix_runs = _renderable_matrix_runs(data)
+    if data.get("reportType") == "matrix":
+        lines.append("Version runs:")
+        for version, run in matrix_runs:
+            run_overall = run.get("overall", {})
+            run_status = (
+                run_overall.get("status", "ERROR")
+                if isinstance(run_overall, Mapping)
+                else "ERROR"
+            )
+            lines.append(
+                f"{version}: {run_status}; negotiated "
+                f"{_protocol_value(run, 'negotiatedVersion')}; "
+                f"{_summary_text(run_overall)}"
+            )
+            for finding in run.get("findings", []):
+                if isinstance(finding, Mapping):
+                    _render_text_finding(lines, finding, indent="  ")
+            for error in run.get("errors", []):
+                if isinstance(error, Mapping):
+                    _render_text_error(lines, error, indent="  ")
 
     findings = data.get("findings", [])
     if findings:
@@ -833,12 +1130,7 @@ def render_text(report: CompatibilityReport | Mapping[str, Any]) -> str:
         for finding in findings:
             if not isinstance(finding, Mapping):
                 continue
-            lines.append(
-                f"{finding.get('status')} {finding.get('code')}  "
-                f"{finding.get('summary')}{_event_refs(finding)}"
-            )
-            if finding.get("status") in {"FAIL", "WARN", "SKIP"} and finding.get("details"):
-                lines.append(f"  {finding['details']}")
+            _render_text_finding(lines, finding)
 
     errors = data.get("errors", [])
     if errors:
@@ -846,11 +1138,7 @@ def render_text(report: CompatibilityReport | Mapping[str, Any]) -> str:
         for error in errors:
             if not isinstance(error, Mapping):
                 continue
-            lines.append(
-                f"ERROR {error.get('code')}  {error.get('summary')}{_event_refs(error)}"
-            )
-            if error.get("details"):
-                lines.append(f"  {error['details']}")
+            _render_text_error(lines, error)
 
     transcript = data.get("transcript")
     if isinstance(transcript, Mapping) and transcript.get("path"):
@@ -876,45 +1164,134 @@ def render_markdown(report: CompatibilityReport | Mapping[str, Any]) -> str:
         f"- Target: `{_markdown_cell(_target_description(data))}`",
         f"- Requested protocol: `{_markdown_cell(_protocol_value(data, 'requestedVersion'))}`",
         f"- Negotiated protocol: `{_markdown_cell(_protocol_value(data, 'negotiatedVersion'))}`",
-        (
-            "- Counts: "
-            + ", ".join(f"{key.upper()} {counts.get(key, 0)}" for key in _COUNT_KEYS)
-            + f", ERRORS {overall.get('errorCount', 0) if isinstance(overall, Mapping) else 0}"
-        ),
-        "",
-        "## Findings",
-        "",
-        "| Status | Code | Basis | Summary | Evidence |",
-        "| --- | --- | --- | --- | --- |",
+        "- Counts: " + _summary_text(overall),
     ]
-    for finding in data.get("findings", []):
+    scenario = data.get("scenario")
+    if isinstance(scenario, Mapping):
+        lines.extend(
+            [
+                f"- Scenario: `{_markdown_cell(scenario.get('name', 'unknown'))}`",
+                f"- Scenario source: `{_markdown_cell(scenario.get('source', 'unknown'))}`",
+                (
+                    f"- Actions completed: {scenario.get('completedActions', 0)}/"
+                    f"{scenario.get('actionCount', 0)}"
+                ),
+            ]
+        )
+    replay = data.get("replay")
+    if isinstance(replay, Mapping):
+        lines.extend(
+            [
+                f"- Replay source: `{_markdown_cell(replay.get('source', 'unknown'))}`",
+                (
+                    f"- Replay actions sent: {replay.get('sentActions', 0)}/"
+                    f"{replay.get('plannedActions', 0)}"
+                ),
+                f"- Matches source: `{_markdown_cell(replay.get('matchesSource', False))}`",
+            ]
+        )
+
+    matrix_runs = _renderable_matrix_runs(data)
+    is_matrix = data.get("reportType") == "matrix"
+    if is_matrix:
+        lines.extend(
+            [
+                "",
+                "## Version summary",
+                "",
+                "| Requested | Negotiated | Era | Status | Counts |",
+                "| --- | --- | --- | --- | --- |",
+            ]
+        )
+        for version, run in matrix_runs:
+            run_overall = run.get("overall", {})
+            run_status = (
+                run_overall.get("status", "ERROR")
+                if isinstance(run_overall, Mapping)
+                else "ERROR"
+            )
+            lines.append(
+                "| "
+                + " | ".join(
+                    _markdown_cell(value)
+                    for value in (
+                        version,
+                        _protocol_value(run, "negotiatedVersion"),
+                        _protocol_value(run, "era"),
+                        run_status,
+                        _summary_text(run_overall),
+                    )
+                )
+                + " |"
+            )
+
+    findings_with_versions: list[tuple[str | None, Mapping[str, Any]]] = []
+    if is_matrix:
+        for version, run in matrix_runs:
+            findings_with_versions.extend(
+                (version, finding)
+                for finding in run.get("findings", [])
+                if isinstance(finding, Mapping)
+            )
+    else:
+        findings_with_versions.extend(
+            (None, finding)
+            for finding in data.get("findings", [])
+            if isinstance(finding, Mapping)
+        )
+
+    finding_columns = ["Status", "Code", "Basis", "Summary", "Evidence"]
+    if is_matrix:
+        finding_columns.insert(0, "Protocol")
+    lines.extend(
+        [
+            "",
+            "## Findings",
+            "",
+            "| " + " | ".join(finding_columns) + " |",
+            "| " + " | ".join("---" for _ in finding_columns) + " |",
+        ]
+    )
+    for version, finding in findings_with_versions:
         if not isinstance(finding, Mapping):
             continue
         evidence = _event_refs(finding).strip().strip("[]")
+        values = [
+            finding.get("status"),
+            finding.get("code"),
+            finding.get("basis"),
+            finding.get("summary"),
+            evidence,
+        ]
+        if is_matrix:
+            values.insert(0, version)
         lines.append(
             "| "
-            + " | ".join(
-                _markdown_cell(value)
-                for value in (
-                    finding.get("status"),
-                    finding.get("code"),
-                    finding.get("basis"),
-                    finding.get("summary"),
-                    evidence,
-                )
-            )
+            + " | ".join(_markdown_cell(value) for value in values)
             + " |"
         )
 
     lines.extend(["", "## Errors", ""])
-    errors = data.get("errors", [])
+    if is_matrix:
+        errors = [
+            (version, error)
+            for version, run in matrix_runs
+            for error in run.get("errors", [])
+            if isinstance(error, Mapping)
+        ]
+    else:
+        errors = [
+            (None, error)
+            for error in data.get("errors", [])
+            if isinstance(error, Mapping)
+        ]
     if errors:
-        for error in errors:
-            if isinstance(error, Mapping):
-                lines.append(
-                    f"- **{_markdown_cell(error.get('code'))}:** "
-                    f"{_markdown_cell(error.get('summary'))}"
-                )
+        for version, error in errors:
+            prefix = f"`{_markdown_cell(version)}` — " if version is not None else ""
+            lines.append(
+                f"- {prefix}**{_markdown_cell(error.get('code'))}:** "
+                f"{_markdown_cell(error.get('summary'))}"
+            )
     else:
         lines.append("None.")
     transcript = data.get("transcript")
@@ -923,11 +1300,49 @@ def render_markdown(report: CompatibilityReport | Mapping[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _validate_existing_report_path(report_path: Path) -> None:
+    """Reject link and special-file destinations without following them.
+
+    ``os.replace`` itself does not follow the destination symlink, but an
+    explicit rejection keeps command behavior deterministic and prevents a
+    report writer from silently changing a path whose ownership semantics are
+    surprising. Opening with ``O_NOFOLLOW`` and checking the opened inode also
+    avoids trusting a path-only ``stat`` result.
+    """
+
+    flags = getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    if hasattr(os, "O_PATH"):
+        flags |= os.O_PATH
+    else:
+        flags |= os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(report_path, flags)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ConfigurationError(
+            f"Report destination is not a safe regular file: {report_path}"
+        ) from exc
+    try:
+        target_stat = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if not stat.S_ISREG(target_stat.st_mode):
+        raise ConfigurationError(
+            f"Report destination must be a regular file: {report_path}"
+        )
+    if target_stat.st_nlink != 1:
+        raise ConfigurationError(
+            f"Report destination must not be hard-linked: {report_path}"
+        )
+
+
 def write_report(path: str | Path, report: CompatibilityReport | Mapping[str, Any]) -> None:
     report_path = Path(path)
     if str(report_path) == "-":
         raise ConfigurationError("write_report does not accept '-' as a stdout sentinel.")
     report_path.parent.mkdir(parents=True, exist_ok=True)
+    _validate_existing_report_path(report_path)
     content = render_json(report)
     temporary_name: str | None = None
     try:
@@ -940,9 +1355,13 @@ def write_report(path: str | Path, report: CompatibilityReport | Mapping[str, An
             delete=False,
         ) as handle:
             temporary_name = handle.name
+            os.fchmod(handle.fileno(), 0o600)
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
+        # Re-check immediately before replacement. A target that appeared or
+        # changed while the report was serialized is rejected as well.
+        _validate_existing_report_path(report_path)
         os.replace(temporary_name, report_path)
     finally:
         if temporary_name is not None:

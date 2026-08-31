@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import time
+
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
@@ -66,8 +68,10 @@ def run_matrix(
     from .checks import run_check
 
     selected = validate_matrix_versions(versions, transport=transport)
+    started_at = dt.datetime.now(dt.UTC).isoformat(timespec="milliseconds")
     started = time.monotonic()
     runs: list[dict[str, Any]] = []
+    known_secrets: set[str] = set()
     for version in selected:
         session = session_factory(version)
         if session.requested_version != version:
@@ -81,12 +85,15 @@ def run_matrix(
             close=True,
         )
         runs.append(report.to_dict())
+        known_secrets.update(session.recorder.known_secrets)
 
     return CompatibilityReport(
         target=target,
         report_type="matrix",
+        started_at=started_at,
         duration_ms=(time.monotonic() - started) * 1000,
         matrix={"versions": list(selected), "runs": runs},
+        known_secrets=tuple(sorted(known_secrets)),
     )
 
 

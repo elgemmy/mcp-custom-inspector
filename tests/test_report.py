@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import tempfile
 import unittest
 from dataclasses import FrozenInstanceError
@@ -13,6 +15,7 @@ from mcp_probe_core.report import (
     CompatibilityReport,
     EvidenceRef,
     Finding,
+    FINDING_CODES,
     RunError,
     aggregate_overall,
     derive_exit_code,
@@ -74,6 +77,10 @@ def report_with(
 
 
 class EvidenceAndFindingTests(unittest.TestCase):
+    def test_batch_and_progress_codes_are_stable_registry_entries(self) -> None:
+        self.assertIn("JSONRPC_BATCH_SUPPORT", FINDING_CODES)
+        self.assertIn("JSONRPC_PROGRESS_TOKEN", FINDING_CODES)
+
     def test_evidence_serializes_stable_shape(self) -> None:
         evidence = EvidenceRef(event="event:7", pointer="/payload/result", note="response")
         self.assertEqual(
@@ -310,6 +317,60 @@ class AggregationAndExitTests(unittest.TestCase):
 
 
 class ReportEnvelopeTests(unittest.TestCase):
+    def test_known_secrets_never_corrupt_report_control_schema(self) -> None:
+        item = Finding(
+            code="NEGOTIATION_PROTOCOL_VERSION",
+            status="PASS",
+            category="negotiation",
+            basis="normative",
+            summary="PASS transport event path a",
+            actual={
+                "transport": "transport",
+                "event": "event",
+                "path": "path",
+                "short": "a",
+            },
+            evidence=(EvidenceRef("event:1", pointer="/payload/result"),),
+        )
+        report = CompatibilityReport(
+            target=stdio_target(["fixture"]),
+            findings=(item,),
+            transcript={
+                "schema": "mcp-probe.transcript.event/v1",
+                "path": "path",
+                "eventCount": 1,
+                "redacted": True,
+            },
+            known_secrets=("PASS", "transport", "event", "path", "a"),
+        ).to_dict()
+
+        self.assertEqual(report["overall"]["status"], "PASS")
+        self.assertEqual(report["target"]["transport"], "stdio")
+        self.assertEqual(
+            set(report["transcript"]),
+            {"schema", "path", "eventCount", "redacted"},
+        )
+        self.assertEqual(report["transcript"]["path"], REDACTED)
+        finding_data = report["findings"][0]
+        self.assertEqual(finding_data["status"], "PASS")
+        self.assertEqual(finding_data["evidence"][0]["event"], "event:1")
+        self.assertEqual(
+            finding_data["evidence"][0]["pointer"], "/payload/result"
+        )
+        self.assertNotIn("transport", finding_data["actual"])
+
+    def test_known_secrets_are_immutable_and_reject_bare_string(self) -> None:
+        source = ["secret"]
+        report = CompatibilityReport(
+            target=stdio_target(["fixture"]), known_secrets=source
+        )
+        source.append("later")
+        self.assertEqual(report.known_secrets, ("secret",))
+        with self.assertRaisesRegex(ValueError, "iterable of strings"):
+            CompatibilityReport(
+                target=stdio_target(["fixture"]), known_secrets="secret"
+            )
+
     def test_exact_required_envelope_and_duplicate_discovery_preserved(self) -> None:
         item = finding("PASS", evidence=(EvidenceRef("event:2"),))
         report = CompatibilityReport(
@@ -343,6 +404,29 @@ class ReportEnvelopeTests(unittest.TestCase):
         self.assertIsNone(data["transcript"])
         self.assertEqual(data["discovery"]["tools"], [{"name": "same"}, {"name": "same"}])
         self.assertEqual(data["discovery"]["resourceTemplates"], [])
+
+    def test_transcript_event_range_is_preserved_and_validated(self) -> None:
+        report = CompatibilityReport(
+            target=stdio_target(["fixture"]),
+            transcript={
+                "path": None,
+                "eventCount": 3,
+                "redacted": True,
+                "firstSeq": 8,
+                "lastSeq": 10,
+            },
+        ).to_dict()
+        self.assertEqual(report["transcript"]["firstSeq"], 8)
+        self.assertEqual(report["transcript"]["lastSeq"], 10)
+        with self.assertRaisesRegex(ValueError, "firstSeq"):
+            CompatibilityReport(
+                target=stdio_target(["fixture"]),
+                transcript={
+                    "eventCount": 2,
+                    "firstSeq": 10,
+                    "lastSeq": 8,
+                },
+            )
 
     def test_report_is_deeply_immutable(self) -> None:
         report = report_with(finding())
@@ -412,7 +496,48 @@ class ReportEnvelopeTests(unittest.TestCase):
             parsed = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(parsed["schema"], REPORT_SCHEMA)
             self.assertEqual(parsed["overall"]["status"], "PASS")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             self.assertEqual(list(path.parent.glob(f".{path.name}.*.tmp")), [])
+
+    def test_write_report_replaces_regular_file_with_private_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            path.write_text("old", encoding="utf-8")
+            path.chmod(0o644)
+            write_report(path, report_with(finding()))
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["schema"], REPORT_SCHEMA)
+
+    def test_write_report_rejects_symlink_without_touching_victim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            victim = Path(directory) / "victim.txt"
+            victim.write_text("unchanged", encoding="utf-8")
+            path = Path(directory) / "report.json"
+            path.symlink_to(victim)
+            with self.assertRaisesRegex(ConfigurationError, "safe regular file|regular file"):
+                write_report(path, report_with(finding()))
+            self.assertTrue(path.is_symlink())
+            self.assertEqual(victim.read_text(encoding="utf-8"), "unchanged")
+
+    def test_write_report_rejects_hardlink_without_touching_victim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            victim = Path(directory) / "victim.txt"
+            victim.write_text("unchanged", encoding="utf-8")
+            path = Path(directory) / "report.json"
+            os.link(victim, path)
+            with self.assertRaisesRegex(ConfigurationError, "hard-linked"):
+                write_report(path, report_with(finding()))
+            self.assertEqual(victim.read_text(encoding="utf-8"), "unchanged")
+            self.assertTrue(path.exists())
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs are not available")
+    def test_write_report_rejects_fifo_without_opening_it_for_io(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            os.mkfifo(path)
+            with self.assertRaisesRegex(ConfigurationError, "regular file"):
+                write_report(path, report_with(finding()))
+            self.assertTrue(stat.S_ISFIFO(path.lstat().st_mode))
 
     def test_write_report_rejects_stdout_sentinel(self) -> None:
         with self.assertRaises(ConfigurationError):
@@ -420,6 +545,44 @@ class ReportEnvelopeTests(unittest.TestCase):
 
 
 class MatrixReportTests(unittest.TestCase):
+    def test_matrix_redacts_all_children_without_corrupting_control_fields(self) -> None:
+        child = CompatibilityReport(
+            target=stdio_target(["fixture", "MATRIX_SECRET"]),
+            requested_version="2025-06-18",
+            negotiated_version="2025-06-18",
+            findings=(
+                Finding(
+                    code="NEGOTIATION_PROTOCOL_VERSION",
+                    status="PASS",
+                    category="negotiation",
+                    basis="normative",
+                    summary="MATRIX_SECRET",
+                    actual={"MATRIX_SECRET": "MATRIX_SECRET"},
+                    evidence=(EvidenceRef("event:1", pointer="/payload/result"),),
+                ),
+            ),
+            server_info={"name": "MATRIX_SECRET"},
+        ).to_dict()
+        report = CompatibilityReport(
+            target=stdio_target(["fixture"]),
+            report_type="matrix",
+            matrix={"versions": ["2025-06-18"], "runs": [child]},
+            known_secrets=("MATRIX_SECRET", "PASS", "event"),
+        ).to_dict()
+
+        rendered = json.dumps(report)
+        self.assertNotIn("MATRIX_SECRET", rendered)
+        self.assertEqual(report["overall"]["status"], "PASS")
+        self.assertEqual(report["matrix"]["versions"], ["2025-06-18"])
+        child_data = report["matrix"]["runs"][0]
+        self.assertEqual(child_data["target"]["transport"], "stdio")
+        self.assertEqual(child_data["findings"][0]["status"], "PASS")
+        self.assertEqual(child_data["findings"][0]["evidence"][0]["event"], "event:1")
+        self.assertEqual(
+            child_data["findings"][0]["evidence"][0]["pointer"],
+            "/payload/result",
+        )
+
     def test_matrix_sums_children_and_derives_exit(self) -> None:
         matrix = {
             "versions": ["2024-11-05", "2025-06-18"],
@@ -466,6 +629,19 @@ class MatrixReportTests(unittest.TestCase):
         self.assertEqual(data["run"]["exitCode"], 1)
         self.assertEqual(data["findings"], [])
 
+        text_output = render_text(report)
+        self.assertIn("Version runs:", text_output)
+        self.assertIn("2024-11-05: PASS", text_output)
+        self.assertIn("2025-06-18: FAIL", text_output)
+        self.assertIn("PASS NEGOTIATION_PROTOCOL_VERSION", text_output)
+        self.assertIn("FAIL NEGOTIATION_PROTOCOL_VERSION", text_output)
+
+        markdown_output = render_markdown(report)
+        self.assertIn("## Version summary", markdown_output)
+        self.assertIn("| 2024-11-05 |", markdown_output)
+        self.assertIn("| 2025-06-18 |", markdown_output)
+        self.assertIn("| Protocol | Status | Code |", markdown_output)
+
     def test_matrix_error_kind_controls_exit(self) -> None:
         matrix = {
             "versions": ["2025-06-18"],
@@ -492,6 +668,40 @@ class MatrixReportTests(unittest.TestCase):
         )
         self.assertEqual(report.exit_code, 3)
         self.assertEqual(report.overall["status"], "ERROR")
+        self.assertIn(
+            "2025-06-18: ERROR", render_text(report)
+        )
+        self.assertIn(
+            "`2025-06-18` — **TRANSPORT_HTTP_CONNECT:**",
+            render_markdown(report),
+        )
+
+    def test_matrix_rejects_unknown_error_kind_instead_of_returning_clean_exit(self) -> None:
+        report = CompatibilityReport(
+            target=stdio_target(["fixture"]),
+            report_type="matrix",
+            matrix={
+                "versions": ["2025-06-18"],
+                "runs": [
+                    {
+                        "findings": [],
+                        "errors": [{"kind": "mystery"}],
+                        "overall": {
+                            "status": "ERROR",
+                            "counts": {
+                                "pass": 0,
+                                "fail": 0,
+                                "warn": 0,
+                                "skip": 0,
+                            },
+                            "errorCount": 1,
+                        },
+                    }
+                ],
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "error kind"):
+            _ = report.exit_code
 
 
 if __name__ == "__main__":
