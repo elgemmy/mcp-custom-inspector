@@ -74,15 +74,12 @@ def run_matrix(
             raise ConfigurationError(
                 "Matrix session factory returned a session for a different protocol version."
             )
-        try:
-            report = run_check(
-                session,
-                timeout=timeout,
-                max_pages=max_pages,
-                close=False,
-            )
-        finally:
-            session.close()
+        report = run_check(
+            session,
+            timeout=timeout,
+            max_pages=max_pages,
+            close=True,
+        )
         runs.append(report.to_dict())
 
     return CompatibilityReport(
