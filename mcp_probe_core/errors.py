@@ -30,4 +30,3 @@ class ProbeTimeout(TransportError, TimeoutError):
 
 class ProcessExited(TransportError):
     """A stdio server exited before the expected protocol event."""
-

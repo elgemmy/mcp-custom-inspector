@@ -216,4 +216,3 @@ def response_error_code(response: Any) -> int | None:
         return None
     code = response["error"].get("code")
     return code if isinstance(code, int) and not isinstance(code, bool) else None
-
