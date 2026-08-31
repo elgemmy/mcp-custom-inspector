@@ -178,12 +178,20 @@ timeouts, and redacted authentication headers. It does not implement OAuth or
 legacy HTTP+SSE. Redirects are deliberately not followed, so credentials and
 session headers are not forwarded to another endpoint. For legacy Streamable
 HTTP, Probe surfaces an expired-session `404` but does not automatically
-reinitialize and retry the operation.
+reinitialize and retry the operation. SSE handling is request-scoped: Probe
+does not keep an independent long-lived GET/listening stream, and events that
+arrive after the correlated POST response are not guaranteed to be retained.
+Probe decodes only absent or `identity` response Content-Encoding. Other
+encodings remain opaque evidence and fail the required exchange. It also
+rejects ambiguous response framing, unsupported transfer codings, and
+incomplete declared bodies.
 
 ## Safety and redaction
 
 - Automated checks call list/discovery methods only; they never infer that a
   tool is safe from its name.
+- Automated lifecycle establishment rejects nested `tools/call`-like data in
+  custom initialization and client capability metadata.
 - Scenario and replay tool calls require an exact allow-list. Ordinary `--raw`
   remains an intentionally explicit wire interface—review the object yourself.
 - Authorization, cookies, API keys/tokens, session IDs, `Mcp-Param-*` argument

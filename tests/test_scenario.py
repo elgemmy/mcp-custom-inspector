@@ -177,6 +177,65 @@ class ScenarioValidationTests(unittest.TestCase):
 
 
 class StdioScenarioTests(unittest.TestCase):
+    def test_active_custom_initialize_is_rejected_at_scenario_api_boundary(self) -> None:
+        recorder = EventRecorder()
+        transport = StdioTransport(
+            stdio_fixture_command("stdio-good-legacy"), {}, recorder
+        )
+        session = McpSession(
+            transport,
+            SessionConfig(
+                protocol_version=LEGACY_VERSION,
+                initialize_message={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "nested": {
+                            " Method ": " TOOLS/CALL ",
+                            " Params ": {" Name ": "fixture_echo"},
+                        }
+                    },
+                },
+            ),
+            recorder,
+        )
+        scenario = definition([{"action": "connect", "establish": True}])
+        with self.assertRaisesRegex(ConfigurationError, "active tools/call"):
+            run_scenario(session, scenario, allow_tools={"fixture_echo"})
+        self.assertIsNone(transport.process)
+        recorder.close()
+
+    def test_active_client_capabilities_are_rejected_at_scenario_api_boundary(self) -> None:
+        recorder = EventRecorder()
+        transport = StdioTransport(
+            stdio_fixture_command("stdio-good-modern"), {}, recorder
+        )
+        session = McpSession(
+            transport,
+            SessionConfig(
+                protocol_version="2026-07-28",
+                client_capabilities={
+                    "extension": (
+                        {
+                            " Method ": " TOOLS/CALL ",
+                            " Params ": {" Name ": "fixture_echo"},
+                        },
+                    )
+                },
+            ),
+            recorder,
+        )
+        # Modern requests inject clientCapabilities into per-request metadata
+        # even without an explicit connect/establish action.
+        scenario = definition(
+            [{"action": "request", "method": "ping", "params": {}}]
+        )
+        with self.assertRaisesRegex(ConfigurationError, "active tools/call"):
+            run_scenario(session, scenario, allow_tools={"fixture_echo"})
+        self.assertIsNone(transport.process)
+        recorder.close()
+
     def test_modern_establishment_and_requests_use_stateless_metadata(self) -> None:
         session, recorder = stdio_session(
             "stdio-good-modern", version="2026-07-28"
@@ -466,8 +525,21 @@ class StdioScenarioTests(unittest.TestCase):
                     "action": "expect",
                     "kind": "serverRequest",
                     "method": "roots/list",
+                    "assertions": [
+                        {"path": "/method", "equals": "roots/list"},
+                        {"path": "/id", "equals": "fixture-roots-request"},
+                    ],
                 },
-                {"action": "expect", "kind": "result"},
+                {
+                    "action": "expect",
+                    "kind": "result",
+                    "assertions": [
+                        {
+                            "path": "/result/protocolVersion",
+                            "equals": LEGACY_VERSION,
+                        }
+                    ],
+                },
             ]
         )
         try:
@@ -479,6 +551,10 @@ class StdioScenarioTests(unittest.TestCase):
             item for item in result.findings if item.code == "SCENARIO_EXPECTATION"
         ]
         self.assertEqual([item.status for item in expectations], ["PASS", "PASS"])
+        assertions = [
+            item for item in result.findings if item.code == "SCENARIO_ASSERTION"
+        ]
+        self.assertEqual([item.status for item in assertions], ["PASS", "PASS", "PASS"])
 
     def test_server_request_expectation_skips_unrelated_notification(self) -> None:
         script = (
@@ -784,6 +860,84 @@ class StdioScenarioTests(unittest.TestCase):
 
 
 class HttpScenarioTests(unittest.TestCase):
+    def test_http_timeout_is_consumed_by_one_expectation(self) -> None:
+        with running_http_fixture("http-sse-timeout", delay=0.2) as fixture:
+            recorder = EventRecorder()
+            session = http_session(fixture.url, recorder)
+            scenario = definition(
+                [
+                    {
+                        "action": "request",
+                        "method": "ping",
+                        "params": {},
+                        "timeout": 0.05,
+                    },
+                    {"action": "expect", "kind": "timeout"},
+                    {"action": "expect", "kind": "timeout"},
+                ]
+            )
+            try:
+                result = run_scenario(session, scenario)
+            finally:
+                recorder.close()
+        expectations = [
+            item for item in result.findings if item.code == "SCENARIO_EXPECTATION"
+        ]
+        self.assertEqual([item.status for item in expectations], ["PASS", "FAIL"])
+        self.assertEqual(result.errors, ())
+
+    def test_wrong_response_id_is_protocol_failure_not_transport_error(self) -> None:
+        with running_http_fixture("http-wrong-id") as fixture:
+            recorder = EventRecorder()
+            session = http_session(fixture.url, recorder)
+            scenario = definition(
+                [
+                    {"action": "request", "method": "ping", "params": {}},
+                    {"action": "expect", "kind": "result"},
+                ]
+            )
+            try:
+                result = run_scenario(session, scenario)
+            finally:
+                recorder.close()
+        self.assertEqual(result.errors, ())
+        step = next(item for item in result.findings if item.code == "SCENARIO_STEP")
+        self.assertEqual(step.status, "FAIL")
+        self.assertEqual(step.actual["error"]["code"], "HTTP_RESPONSE_CORRELATION")
+        causal_seq = int(step.evidence[0].event.split(":", 1)[1])
+        causal = next(event for event in recorder.events if event["seq"] == causal_seq)
+        self.assertEqual(causal["classification"], "response")
+        self.assertNotEqual(causal["payload"]["id"], 1)
+
+    def test_global_content_encoding_requires_opaque_wire_opt_in(self) -> None:
+        with running_http_fixture("http-json") as fixture:
+            recorder = EventRecorder()
+            config = SessionConfig(protocol_version=LEGACY_VERSION)
+            transport = HttpTransport(
+                fixture.url,
+                {"Content-Encoding": "base64"},
+                recorder,
+                config.profile,
+            )
+            session = McpSession(transport, config, recorder)
+            scenario = definition(
+                [
+                    {
+                        "action": "malformed",
+                        "data": '{"jsonrpc":"2.0","method":"notifications/test"}',
+                        "contentType": "application/json",
+                    }
+                ]
+            )
+            try:
+                result = run_scenario(session, scenario)
+            finally:
+                recorder.close()
+        self.assertEqual(
+            [item.code for item in result.errors], ["CONFIG_UNSAFE_ACTION"]
+        )
+        self.assertEqual(fixture.state.received_http, [])
+
     def test_raw_tool_call_cannot_bypass_allow_list_over_http(self) -> None:
         with running_http_fixture("http-json") as fixture:
             recorder = EventRecorder()

@@ -59,8 +59,11 @@ STDIO_PROFILES = (
 HTTP_PROFILES = (
     "http-json",
     "http-malformed-body",
+    "http-malformed-status",
     "http-sse",
     "http-sse-multi",
+    "http-sse-malformed-then-valid",
+    "http-sse-timeout",
     "http-session",
     "http-delayed-response",
     "http-error",
@@ -117,8 +120,10 @@ class FixtureConfig:
     mismatch_then_correct: bool = False
     http_error_status: int = 503
     empty_status: int = 202
+    termination_status: int = 204
     session_id: str = "fixture-session-id"
     require_protocol_header: bool = False
+    response_session_id: bool = False
     stderr_line: str | None = None
 
     def __post_init__(self) -> None:
@@ -173,6 +178,8 @@ class FixtureConfig:
             raise ValueError("HTTP error status must be between 100 and 599")
         if not 100 <= self.empty_status <= 599:
             raise ValueError("Empty HTTP status must be between 100 and 599")
+        if not 100 <= self.termination_status <= 599:
+            raise ValueError("Termination HTTP status must be between 100 and 599")
 
 
 @dataclass
@@ -691,6 +698,11 @@ class FixtureHttpHandler(BaseHTTPRequestHandler):
             }
         )
 
+        if self.server.config.profile == "http-malformed-status":
+            self.connection.sendall(b"NOTHTTP\x1b[31m malformed-status\r\n\r\n")
+            self.close_connection = True
+            return
+
         try:
             message = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -732,7 +744,10 @@ class FixtureHttpHandler(BaseHTTPRequestHandler):
             return
 
         responses = self.server.engine.handle(message)
-        if self.server.config.profile == "http-session" and self._is_initialize(message):
+        if (
+            self.server.config.profile == "http-session"
+            and self._is_initialize(message)
+        ) or self.server.config.response_session_id:
             extra_headers = {"Mcp-Session-Id": self.server.config.session_id}
         else:
             extra_headers = None
@@ -765,6 +780,38 @@ class FixtureHttpHandler(BaseHTTPRequestHandler):
                 return
 
         profile = self.server.config.profile
+        if profile == "http-sse-timeout":
+            prefix = self._encode_sse(
+                [
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/message",
+                        "params": {"level": "info", "data": "fixture event"},
+                    }
+                ]
+            )
+            self.send_response(response_status)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(prefix)
+            self.wfile.flush()
+            time.sleep(self.server.config.delay)
+            try:
+                self.wfile.write(self._encode_sse(responses))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
+        if profile == "http-sse-malformed-then-valid":
+            self._send_bytes(
+                response_status,
+                b"data: {broken\n\n" + self._encode_sse(responses),
+                "text/event-stream",
+                extra_headers,
+            )
+            return
+
         if profile in {"http-sse", "http-sse-multi"}:
             messages = responses
             if profile == "http-sse-multi":
@@ -804,7 +851,7 @@ class FixtureHttpHandler(BaseHTTPRequestHandler):
             self._send_bytes(404, b"unknown session", "text/plain")
             return
         self.server.state.terminated = True
-        self._send_bytes(204, b"", None)
+        self._send_bytes(self.server.config.termination_status, b"", None)
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         self._send_bytes(405, b"", None, {"Allow": "POST, DELETE"})
@@ -927,8 +974,10 @@ def _config_from_args(args: argparse.Namespace) -> FixtureConfig:
         mismatch_then_correct=args.mismatch_then_correct,
         http_error_status=args.http_error_status,
         empty_status=args.empty_status,
+        termination_status=args.termination_status,
         session_id=args.session_id,
         require_protocol_header=args.require_protocol_header,
+        response_session_id=args.response_session_id,
         stderr_line=args.stderr_line,
     )
 
@@ -1004,8 +1053,10 @@ def _add_config_args(parser: argparse.ArgumentParser, profiles: tuple[str, ...])
     parser.add_argument("--mismatch-then-correct", action="store_true")
     parser.add_argument("--http-error-status", type=int, default=503)
     parser.add_argument("--empty-status", type=int, default=202)
+    parser.add_argument("--termination-status", type=int, default=204)
     parser.add_argument("--session-id", default="fixture-session-id")
     parser.add_argument("--require-protocol-header", action="store_true")
+    parser.add_argument("--response-session-id", action="store_true")
     parser.add_argument("--stderr-line")
 
 

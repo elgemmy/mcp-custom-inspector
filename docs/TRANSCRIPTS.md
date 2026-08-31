@@ -106,6 +106,10 @@ long captured pauses can delay a replay (defaults: one second per pause and 30
 seconds total). `--timing-scale` multiplies each captured delay before those
 safety caps are applied.
 
+For every captured timeout checkpoint, replay `--timeout` must be at least its
+recorded `timeoutSeconds`. Probe validates this before opening the target and
+never shortens a captured checkpoint.
+
 ```bash
 python3 mcp_probe.py replay stdio \
   --from /tmp/original.ndjson \
@@ -118,27 +122,38 @@ The source and destination transcript paths must be different. Replay does not
 perform a new automatic establishment exchange: initialize, initialized, or
 modern discovery/metadata are sent only if they were client events in the
 source. When `--protocol-version` is omitted, Probe infers the first captured
-initialize or modern per-request version; an explicit value keeps the expected
-era visible. The selected HTTP profile must match the replay plan.
+initialize or modern per-request version when present; metadata-free/raw traces
+use the current default. Pass an explicit version to keep that choice visible.
+The selected HTTP profile must match the replay plan.
 
 Source and target transports must match. For stdio, each captured
 server-to-client message becomes an ordered receive checkpoint. For HTTP, each
 captured POST defines a response window. Replay compares classification,
-JSON-RPC ID and ID type, method, result-versus-error shape, error code, and HTTP
-status where present; it deliberately does not require a server-specific result
-payload to be byte-for-byte identical. Transport metadata that cannot safely or
-meaningfully transfer is rebuilt for the destination. `REPLAY_EVENT`,
+JSON-RPC version, ID and ID type, method, result-versus-error shape, error code,
+batch grouping/order, revision-specific negotiation/result metadata, HTTP
+status, stream-timeout state, parse issues, and session diagnostics where
+present. It deliberately does not require a server-specific application result
+payload to be byte-for-byte identical. Captured timeout and unexpected nonzero
+stdio process-exit events are checkpoints too. Transport metadata that cannot
+safely or meaningfully transfer is rebuilt for the destination. `REPLAY_EVENT`,
 `REPLAY_RESPONSE_MATCH`, and `REPLAY_COMPLETE` findings make those comparisons
 machine-readable. For newly captured raw-wire events, replay also preserves the
 stdio newline choice. Older v1 events without that field default to appending a
 newline. An event marked `exactBytesRecorded: false` is rejected because
 replacement text cannot faithfully reproduce the bytes.
 
+A `capture_limit` marker means the source interaction is incomplete, so replay
+rejects it before opening a target. After the last stdio checkpoint Probe uses a
+bounded observation window and also reconciles messages received during cleanup;
+asynchronous traffic arriving later than that window is not claimed to match.
+
 HTTP raw replay reuses only the captured Content-Type media-type token; it drops
 parameters and derives every other header afresh. Captured authorization,
 cookies, sessions, and MCP headers are ignored. A malformed HTTP body is
 compared through its recorded `invalid_body` checkpoint rather than treated as
-a decoded JSON-RPC message.
+a decoded JSON-RPC message. If destination headers change the representation
+away from unencoded UTF-8 JSON (for example through `Content-Encoding`), replay
+requires `--allow-opaque-wire` before opening the connection.
 
 Captured authorization, cookies, API keys, session identifiers, and other
 redacted data are never recovered or silently resent. A `[REDACTED]` payload

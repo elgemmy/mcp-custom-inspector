@@ -21,6 +21,69 @@ def finding(report, code):
 
 
 class CheckOptionsTests(unittest.TestCase):
+    def test_active_custom_initialize_is_rejected_before_check_target_start(self):
+        recorder = EventRecorder()
+        transport = StdioTransport(
+            stdio_fixture_command("stdio-good-legacy"), {}, recorder
+        )
+        session = McpSession(
+            transport,
+            SessionConfig(
+                LEGACY,
+                initialize_message={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        # Programmatic callers can supply tuples, which the
+                        # JSON encoder serializes as arrays on the wire.
+                        "nested": (
+                            {
+                                "method": "tools/call",
+                                "params": {"name": "fixture_echo"},
+                            },
+                        )
+                    },
+                },
+            ),
+            recorder,
+        )
+        with self.assertRaisesRegex(ConfigurationError, "active tools/call"):
+            run_check(session)
+        self.assertIsNone(transport.process)
+        recorder.close()
+
+    def test_active_client_capabilities_are_rejected_in_both_lifecycle_eras(self):
+        active_capabilities = {
+            "extension": (
+                {
+                    "method": "tools/call",
+                    "params": {"name": "fixture_echo"},
+                },
+            )
+        }
+        for version, profile in (
+            (LEGACY, "stdio-good-legacy"),
+            (MODERN, "stdio-good-modern"),
+        ):
+            with self.subTest(version=version):
+                recorder = EventRecorder()
+                transport = StdioTransport(
+                    stdio_fixture_command(profile), {}, recorder
+                )
+                session = McpSession(
+                    transport,
+                    SessionConfig(
+                        version,
+                        client_capabilities=active_capabilities,
+                    ),
+                    recorder,
+                )
+                with self.assertRaisesRegex(ConfigurationError, "active tools/call"):
+                    run_check(session)
+                self.assertIsNone(transport.process)
+                recorder.close()
+
     def test_numeric_bounds_reject_bool_non_finite_and_unbounded_pages(self):
         for value in (True, "1", 0, -1, math.inf, -math.inf, math.nan):
             with self.subTest(timeout=value):
@@ -489,6 +552,25 @@ class CompatibilityChecksHttpTests(unittest.TestCase):
         self.assertEqual(finding(report, "HTTP_SESSION_ID").status, "PASS")
         self.assertEqual(finding(report, "HTTP_SESSION_TERMINATION").status, "PASS")
         self.assertTrue(running.state.terminated)
+
+    def test_modern_server_session_id_is_a_lifecycle_failure(self):
+        report, recorder, _ = self.run_http(
+            "http-json",
+            version=MODERN,
+            fixture_options={
+                "protocol_version": MODERN,
+                "response_session_id": True,
+            },
+        )
+        self.assertEqual(report.exit_code, 1)
+        session_finding = finding(report, "HTTP_SESSION_ID")
+        self.assertEqual(session_finding.status, "FAIL")
+        self.assertTrue(
+            any(
+                event.get("classification") == "unexpected_session_id"
+                for event in recorder.events
+            )
+        )
 
     def test_malformed_body_and_wrong_content_type_are_protocol_failures(self):
         malformed, _, _ = self.run_http("http-malformed-body")

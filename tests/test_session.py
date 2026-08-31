@@ -383,6 +383,69 @@ class LegacySessionTests(unittest.TestCase):
                 sum(request["method"] == "DELETE" for request in requests), 1
             )
 
+    def test_raw_response_with_id_does_not_expect_a_second_http_response(self) -> None:
+        with running_http_fixture("http-empty", empty_status=202) as fixture:
+            recorder = EventRecorder()
+            transport = HttpTransport(
+                fixture.url, {}, recorder, profile_for(LEGACY_VERSION)
+            )
+            session = McpSession(
+                transport, SessionConfig(protocol_version=LEGACY_VERSION), recorder
+            )
+            response = {
+                "jsonrpc": "2.0",
+                "id": "server-request-1",
+                "result": {"roots": []},
+            }
+            outcome = session.send_raw_object(response, 0.2)
+
+        self.assertEqual(outcome.status, 202)
+        self.assertEqual(outcome.messages, [])
+        self.assertEqual(
+            json.loads(fixture.state.received_http[0]["body"]), response
+        )
+
+    def test_raw_http_request_returns_wrong_id_exchange_for_inspection(self) -> None:
+        with running_http_fixture("http-wrong-id") as fixture:
+            recorder = EventRecorder()
+            transport = HttpTransport(
+                fixture.url, {}, recorder, profile_for(LEGACY_VERSION)
+            )
+            session = McpSession(
+                transport, SessionConfig(protocol_version=LEGACY_VERSION), recorder
+            )
+            request = {"jsonrpc": "2.0", "id": 77, "method": "ping", "params": {}}
+            outcome = session.send_raw_object(request, 0.2)
+
+        self.assertEqual(outcome.status, 200)
+        self.assertEqual(len(outcome.messages), 1)
+        self.assertNotEqual(outcome.messages[0].payload["id"], 77)
+
+    def test_raw_stdio_request_with_fractional_id_surfaces_next_response(self) -> None:
+        recorder = EventRecorder()
+        transport = StdioTransport(
+            stdio_fixture_command("stdio-good-legacy"), {}, recorder
+        )
+        session = McpSession(
+            transport, SessionConfig(protocol_version=LEGACY_VERSION), recorder
+        )
+        try:
+            self.assertTrue(session.establish(1).success)
+            outcome = session.send_raw_object(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1.5,
+                    "method": "ping",
+                    "params": {},
+                },
+                1,
+            )
+        finally:
+            session.close()
+
+        self.assertEqual(outcome.response.payload["id"], 1.5)
+        self.assertIn("result", outcome.response.payload)
+
 
 class ModernSessionTests(unittest.TestCase):
     def test_modern_establish_uses_discover_per_request_metadata_and_no_legacy_lifecycle(self) -> None:

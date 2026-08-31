@@ -16,6 +16,8 @@ from copy import deepcopy
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
+from .protocol import strict_json_loads
+
 
 REDACTED = "[REDACTED]"
 
@@ -131,6 +133,17 @@ _JSONRPC_ENVELOPE_KEYS = frozenset(
 _JSONRPC_ERROR_KEYS = frozenset({"code", "message", "data"})
 
 _SENSITIVE_COMPACT_SUFFIXES = (
+    "apikey",
+    "accesskey",
+    "authkey",
+    "credentialkey",
+    "encryptionkey",
+    "functionkey",
+    "functionskey",
+    "licensekey",
+    "secretkey",
+    "subscriptionkey",
+    "webhookkey",
     "token",
     "password",
     "passwd",
@@ -156,9 +169,15 @@ def sensitive_key(name: str) -> bool:
 
 def sensitive_header(name: str) -> bool:
     normalized = name.strip().lower()
+    compact = re.sub(r"[^a-z0-9]", "", normalized)
     return (
         normalized in _SENSITIVE_HEADERS
         or normalized.startswith(_SENSITIVE_HEADER_PREFIXES)
+        # Custom API gateways use many non-standard names (for example
+        # X-Client-Key or GoogleApiKey).  Header values ending in a key marker
+        # are safer to over-redact; keep this broader rule header-specific so
+        # ordinary JSON properties such as "monkey" remain visible.
+        or compact.endswith("key")
         or sensitive_key(normalized)
     )
 
@@ -570,8 +589,8 @@ def redact_raw(raw: str, known_secrets: Iterable[str] = ()) -> str:
     """
 
     try:
-        decoded = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+        decoded = strict_json_loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         # A malformed value has no trustworthy closing boundary.  A single
         # linear scan looks only for key/colon syntax; if a credential-shaped
         # key is present, withhold the complete wire value.  Avoid regexes that
@@ -584,7 +603,11 @@ def redact_raw(raw: str, known_secrets: Iterable[str] = ()) -> str:
     safe = redact_protocol_payload(decoded, known_secrets=known_secrets)
     if safe != decoded:
         return json.dumps(safe, ensure_ascii=False, separators=(",", ":"))
-    return redact_text(raw, known_secrets)
+    # Strict decoding proves there are no duplicate keys hiding an earlier
+    # secret-bearing value. Preserve exact safe framing so a configured secret
+    # which happens to equal JSON-RPC vocabulary (for example ``id`` or
+    # ``ping``) cannot rewrite the protocol envelope or method.
+    return raw
 
 
 def _malformed_has_sensitive_key(raw: str) -> bool:

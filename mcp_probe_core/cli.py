@@ -30,17 +30,28 @@ from .errors import (
     EXIT_CONFIGURATION_ERROR,
     EXIT_INTERNAL_ERROR,
     EXIT_OK,
+    EXIT_TRANSPORT_FAILURE,
     ConfigurationError,
+    HttpExchangeError,
     ProbeError,
+    TransportError,
 )
-from .protocol import LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, profile_for
+from .io_safety import InputLimitError, read_utf8_limited
+from .protocol import (
+    LATEST_PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
+    profile_for,
+    strict_json_loads,
+)
 from .redaction import (
+    contains_redaction,
     known_secrets_from_command,
     redact_headers,
     redact_raw,
     redact_text,
     redact_value,
 )
+from .safety import find_active_tool_calls
 from .session import McpSession, RpcOutcome, SessionConfig
 from .transcript import EventRecorder, pretty_json
 from .transports import HttpExchange, HttpTransport, StdioTransport
@@ -49,6 +60,7 @@ from .transports import HttpExchange, HttpTransport, StdioTransport
 JsonObject = dict[str, Any]
 OUTPUT_FORMATS = ("text", "json", "markdown")
 _HTTP_FIELD_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
+MAX_CLI_JSON_BYTES = 8 * 1024 * 1024
 
 
 @dataclass
@@ -71,25 +83,20 @@ class _ProbeArgumentParser(argparse.ArgumentParser):
 
 
 def _read_json(text: str, *, label: str) -> Any:
-    def parse_float(value: str) -> float:
-        number = float(value)
-        if not math.isfinite(number):
-            raise ValueError("number is outside the finite JSON range")
-        return number
-
-    def reject_constant(value: str) -> None:
-        raise ValueError(f"non-standard JSON numeric constant {value}")
-
     try:
         if text.startswith("@"):
             path = Path(text[1:])
-            text = path.read_text(encoding="utf-8")
-        return json.loads(
-            text,
-            parse_float=parse_float,
-            parse_constant=reject_constant,
-        )
-    except OSError as exc:
+            text = read_utf8_limited(
+                path,
+                max_bytes=MAX_CLI_JSON_BYTES,
+                label=label,
+            )
+        elif len(text.encode("utf-8")) > MAX_CLI_JSON_BYTES:
+            raise InputLimitError(
+                f"{label} exceeds the {MAX_CLI_JSON_BYTES}-byte safety limit"
+            )
+        return strict_json_loads(text)
+    except (OSError, UnicodeError, InputLimitError) as exc:
         raise ConfigurationError(f"Could not read {label}: {exc}") from exc
     except (json.JSONDecodeError, ValueError) as exc:
         raise ConfigurationError(f"Invalid JSON for {label}: {exc}") from exc
@@ -110,13 +117,27 @@ def _load_initialize(args: argparse.Namespace) -> JsonObject | None:
     if not isinstance(supplied, dict):
         raise ConfigurationError("Initialize params must be a JSON object.")
     if supplied.get("method") is not None:
-        return supplied
-    return {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": supplied,
-    }
+        if supplied.get("method") != "initialize":
+            raise ConfigurationError(
+                "A full --init-json/--init-file payload must use method "
+                "'initialize'. Use --raw or a scenario exact action for other "
+                "protocol messages."
+            )
+        message = supplied
+    else:
+        message = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": supplied,
+        }
+    if find_active_tool_calls(message):
+        raise ConfigurationError(
+            "Initialize configuration contains a nested tools/call-like object. "
+            "Automated lifecycle establishment is non-destructive; use an exact "
+            "scenario action with --allow-tool for an explicitly authorized call."
+        )
+    return message
 
 
 def _load_capabilities(value: str | None) -> JsonObject:
@@ -125,6 +146,11 @@ def _load_capabilities(value: str | None) -> JsonObject:
     capabilities = _read_json(value, label="--client-capabilities")
     if not isinstance(capabilities, dict):
         raise ConfigurationError("--client-capabilities must be a JSON object.")
+    if find_active_tool_calls(capabilities):
+        raise ConfigurationError(
+            "Client capabilities contain a nested tools/call-like object. "
+            "Automated lifecycle metadata must remain non-destructive."
+        )
     return capabilities
 
 
@@ -144,6 +170,7 @@ def _parse_key_values(values: Sequence[str] | None, flag: str) -> dict[str, str]
 
 def _parse_headers(values: Sequence[str] | None) -> dict[str, str]:
     result: dict[str, str] = {}
+    normalized_names: set[str] = set()
     for item in values or ():
         if "\r" in item or "\n" in item:
             raise ConfigurationError("--header names and values must not contain CR or LF.")
@@ -157,6 +184,12 @@ def _parse_headers(values: Sequence[str] | None) -> dict[str, str]:
             raise ConfigurationError(
                 "--header name contains characters outside the HTTP field-name grammar."
             )
+        normalized = key.lower()
+        if normalized in normalized_names:
+            raise ConfigurationError(
+                "--header contains a duplicate case-insensitive header name."
+            )
+        normalized_names.add(normalized)
         result[key] = value.strip()
     return result
 
@@ -213,7 +246,10 @@ def _runtime(
                     "MCP Probe does not implement deprecated HTTP+SSE."
                 )
             if args.include_protocol_header_on_initialize:
-                headers.setdefault("MCP-Protocol-Version", config.protocol_version)
+                if not any(
+                    name.lower() == "mcp-protocol-version" for name in headers
+                ):
+                    headers["MCP-Protocol-Version"] = config.protocol_version
             transport = HttpTransport(
                 args.url,
                 headers,
@@ -237,6 +273,7 @@ def _safe_http(exchange: HttpExchange, recorder: EventRecorder) -> JsonObject:
         "raw": recorder.redact_raw(exchange.body),
         "parseIssues": [recorder.redact_text(issue) for issue in exchange.parse_issues],
         "timedOut": exchange.timed_out,
+        "bodyComplete": exchange.body_complete,
     }
 
 
@@ -248,6 +285,17 @@ def _safe_outcome(value: Any, recorder: EventRecorder) -> Any:
     if isinstance(value, HttpExchange):
         return _safe_http(value, recorder)
     return recorder.redact_value(value)
+
+
+def _failed_http_value(
+    error: HttpExchangeError, recorder: EventRecorder
+) -> JsonObject:
+    value = _safe_http(error.exchange, recorder)
+    value["error"] = {
+        "code": error.finding_code,
+        "message": recorder.redact_text(str(error)),
+    }
+    return value
 
 
 def _emit_inspection(
@@ -332,13 +380,79 @@ def run_inspection(args: argparse.Namespace) -> int:
     records: list[tuple[str, Any]] = []
     inspection_closed = False
     try:
-        established = runtime.session.establish(args.timeout)
+        lifecycle_label = (
+            "server/discover"
+            if runtime.session.profile.modern
+            and not args.init_file
+            and not args.init_json
+            else "initialize"
+        )
+        try:
+            established = runtime.session.establish(args.timeout)
+        except HttpExchangeError as exc:
+            records.append(
+                (lifecycle_label, _failed_http_value(exc, runtime.recorder))
+            )
+            runtime.session.close()
+            inspection_closed = True
+            if args.report:
+                _write_json_file(
+                    args.report, _inspection_document(records, runtime)
+                )
+            _emit_inspection(records, args.output, runtime.recorder)
+            return EXIT_TRANSPORT_FAILURE
+        except TransportError as exc:
+            transport_code = (
+                "TRANSPORT_HTTP_IO"
+                if isinstance(runtime.session.transport, HttpTransport)
+                else "TRANSPORT_STDIO_EOF"
+            )
+            if isinstance(runtime.session.transport, StdioTransport):
+                print(
+                    f"mcp-probe: {runtime.recorder.redact_text(str(exc))}",
+                    file=sys.stderr,
+                )
+            records.append(
+                (
+                    lifecycle_label,
+                    {
+                        "error": {
+                            "code": transport_code,
+                            "message": runtime.recorder.redact_text(str(exc)),
+                        },
+                        "evidence": runtime.recorder.last_reference(),
+                    },
+                )
+            )
+            try:
+                runtime.session.close()
+            except TransportError as cleanup_exc:
+                records.append(
+                    (
+                        "cleanup",
+                        {
+                            "error": {
+                                "code": transport_code,
+                                "message": runtime.recorder.redact_text(
+                                    str(cleanup_exc)
+                                ),
+                            },
+                            "evidence": runtime.recorder.last_reference(),
+                        },
+                    )
+                )
+            inspection_closed = True
+            if args.report:
+                _write_json_file(
+                    args.report, _inspection_document(records, runtime)
+                )
+            _emit_inspection(records, args.output, runtime.recorder)
+            return EXIT_TRANSPORT_FAILURE
         if established.http_exchange is not None:
             init_value: Any = _safe_http(established.http_exchange, runtime.recorder)
         else:
             init_value = runtime.recorder.redact_value(established.response.payload)
-        label = "server/discover" if runtime.session.profile.modern and not args.init_file and not args.init_json else "initialize"
-        records.append((label, init_value))
+        records.append((lifecycle_label, init_value))
 
         if args.discover and established.success:
             for method in ("tools/list", "resources/list", "prompts/list"):
@@ -351,6 +465,10 @@ def run_inspection(args: argparse.Namespace) -> int:
                                 runtime.recorder,
                             ),
                         )
+                    )
+                except HttpExchangeError as exc:
+                    records.append(
+                        (method, _failed_http_value(exc, runtime.recorder))
                     )
                 except ProbeError as exc:
                     records.append(
@@ -372,8 +490,39 @@ def run_inspection(args: argparse.Namespace) -> int:
             message = _read_json(raw, label="--raw")
             if not isinstance(message, dict):
                 raise ConfigurationError("--raw must be a JSON-RPC object.")
-            outcome = runtime.session.send_raw_object(message, args.timeout)
             label = f"raw {message.get('method') or message.get('id')}"
+            try:
+                outcome = runtime.session.send_raw_object(message, args.timeout)
+            except HttpExchangeError as exc:
+                records.append((label, _failed_http_value(exc, runtime.recorder)))
+                runtime.session.close()
+                inspection_closed = True
+                if args.report:
+                    _write_json_file(
+                        args.report, _inspection_document(records, runtime)
+                    )
+                _emit_inspection(records, args.output, runtime.recorder)
+                return exc.exit_code
+            except ProbeError as exc:
+                records.append(
+                    (
+                        label,
+                        {
+                            "error": {
+                                "code": type(exc).__name__,
+                                "message": runtime.recorder.redact_text(str(exc)),
+                            }
+                        },
+                    )
+                )
+                runtime.session.close()
+                inspection_closed = True
+                if args.report:
+                    _write_json_file(
+                        args.report, _inspection_document(records, runtime)
+                    )
+                _emit_inspection(records, args.output, runtime.recorder)
+                return exc.exit_code
             records.append((label, _safe_outcome(outcome, runtime.recorder)))
 
         if args.interactive:
@@ -411,7 +560,7 @@ def _interactive(session: McpSession, timeout: float) -> None:
             return
         try:
             if line.startswith("raw "):
-                message = json.loads(line[4:])
+                message = _read_json(line[4:], label="interactive raw input")
                 if not isinstance(message, dict):
                     raise ValueError("raw input must be a JSON object")
                 outcome = session.send_raw_object(message, timeout)
@@ -431,14 +580,22 @@ def _interactive(session: McpSession, timeout: float) -> None:
                 if len(parts) < 2:
                     print("usage: notify method [json-params]")
                     continue
-                params = json.loads(parts[2]) if len(parts) > 2 else None
+                params = (
+                    _read_json(parts[2], label="interactive notification params")
+                    if len(parts) > 2
+                    else None
+                )
                 message: JsonObject = {"jsonrpc": "2.0", "method": parts[1]}
                 if params is not None:
                     message["params"] = params
                 session.send_notification(message, timeout)
             else:
                 parts = shlex.split(line)
-                params = json.loads(parts[1]) if len(parts) > 1 else {}
+                params = (
+                    _read_json(parts[1], label="interactive request params")
+                    if len(parts) > 1
+                    else {}
+                )
                 outcome = session.rpc(parts[0], params, timeout)
                 _emit_inspection(
                     [(parts[0], _safe_outcome(outcome, session.recorder))],
@@ -627,6 +784,7 @@ def run_scenario_command(args: argparse.Namespace) -> int:
 def run_replay_command(args: argparse.Namespace) -> int:
     from .replay import (
         ReplayOptions,
+        ReplayResult,
         ensure_distinct_transcript_paths,
         load_replay_plan,
         replay_plan,
@@ -662,17 +820,38 @@ def run_replay_command(args: argparse.Namespace) -> int:
             allow_tools=tuple(args.allow_tool or ()),
             allow_opaque_wire=args.allow_opaque_wire,
         )
-        result = replay_plan(
-            plan,
-            runtime.session.transport,
-            runtime.recorder,
-            options,
-        )
+        result: ReplayResult | None = None
+        try:
+            result = replay_plan(
+                plan,
+                runtime.session.transport,
+                runtime.recorder,
+                options,
+            )
+        except TransportError as exc:
+            result = _replay_transport_failure_result(
+                plan,
+                runtime,
+                selected_version,
+                exc,
+                phase="execution",
+            )
         # Replay owns no lifecycle cleanup.  Capture target shutdown evidence
         # before freezing the report while leaving the recorder open to emit it.
-        cleanup = runtime.session.close()
+        try:
+            cleanup = runtime.session.close()
+        except TransportError as exc:
+            result = _replay_transport_failure_result(
+                plan,
+                runtime,
+                selected_version,
+                exc,
+                phase="cleanup",
+                prior=result,
+            )
+        else:
+            result = _apply_replay_cleanup(result, cleanup, runtime.recorder)
         replay_closed = True
-        result = _apply_replay_cleanup(result, cleanup, runtime.recorder)
         report = _report_from_result(
             result,
             runtime,
@@ -695,14 +874,212 @@ def run_replay_command(args: argparse.Namespace) -> int:
         runtime.recorder.close()
 
 
+def _replay_transport_failure_result(
+    plan: Any,
+    runtime: _Runtime,
+    protocol_version: str,
+    exc: TransportError,
+    *,
+    phase: str,
+    prior: Any | None = None,
+) -> Any:
+    """Convert target I/O failures into the same stable replay report model."""
+
+    from .errors import ProbeTimeout, ProcessExited
+    from .replay import ReplayResult
+    from .report import EvidenceRef, Finding, RunError
+
+    transport = runtime.session.transport
+    is_http = isinstance(transport, HttpTransport)
+    if isinstance(exc, ProbeTimeout):
+        code = "TRANSPORT_HTTP_TIMEOUT" if is_http else "TRANSPORT_STDIO_TIMEOUT"
+    elif isinstance(exc, ProcessExited):
+        code = (
+            "TRANSPORT_STDIO_CHILD_EXIT"
+            if getattr(transport, "returncode", None) not in {None, 0}
+            else "TRANSPORT_STDIO_EOF"
+        )
+    elif is_http:
+        observed_response = any(
+            event.get("direction") == "server_to_client"
+            and event.get("transport") == "http"
+            for event in runtime.recorder.events
+        )
+        code = (
+            "TRANSPORT_HTTP_IO"
+            if observed_response or phase == "cleanup"
+            else "TRANSPORT_HTTP_CONNECT"
+        )
+    else:
+        code = (
+            "TRANSPORT_STDIO_STARTUP"
+            if getattr(transport, "process", None) is None and phase == "execution"
+            else "TRANSPORT_STDIO_EOF"
+        )
+
+    evidence_name = runtime.recorder.last_reference()
+    evidence = (EvidenceRef(evidence_name),) if evidence_name is not None else ()
+    phase_label = "target cleanup" if phase == "cleanup" else "target execution"
+    error = RunError(
+        code=code,
+        kind="transport",
+        summary=f"Replay {phase_label} failed.",
+        details=str(exc),
+        evidence=evidence,
+    )
+    failure = Finding(
+        code="REPLAY_COMPLETE",
+        status="FAIL",
+        category="replay",
+        basis="operational",
+        summary=f"Replay could not complete because {phase_label} failed.",
+        details=str(exc),
+        expected={"completed": True, "transportFailure": None},
+        actual={
+            "completed": (
+                False
+                if phase == "execution"
+                else bool(getattr(prior, "completed", False))
+            ),
+            "transportFailure": code,
+            "exception": type(exc).__name__,
+        },
+        evidence=evidence,
+    )
+
+    if prior is not None:
+        findings = tuple(
+            failure if finding.code == "REPLAY_COMPLETE" else finding
+            for finding in prior.findings
+        )
+        if not any(finding.code == "REPLAY_COMPLETE" for finding in prior.findings):
+            findings += (failure,)
+        return replace(
+            prior,
+            completed=prior.completed if phase == "cleanup" else False,
+            matches_source=False,
+            findings=findings,
+            errors=prior.errors + (error,),
+        )
+
+    sent_actions = sum(
+        event.get("direction") == "client_to_server"
+        and event.get("transport") == plan.source_transport
+        for event in runtime.recorder.events
+    )
+    received_messages = sum(
+        event.get("direction") == "server_to_client"
+        and event.get("transport") == plan.source_transport
+        for event in runtime.recorder.events
+    )
+    return ReplayResult(
+        source_transport=plan.source_transport,
+        target_transport="http" if is_http else "stdio",
+        protocol_version=protocol_version,
+        negotiated_version=runtime.session.negotiated_version,
+        source_event_count=len(plan.events),
+        planned_actions=plan.client_event_count,
+        sent_actions=sent_actions,
+        received_messages=received_messages,
+        completed=False,
+        matches_source=False,
+        credentials_reused=False,
+        redactions_applied=contains_redaction(runtime.recorder.events),
+        active_tools=plan.active_tools,
+        opaque_wire_event_count=plan.opaque_wire_event_count,
+        findings=(failure,),
+        errors=(error,),
+        evidence=(evidence_name,) if evidence_name is not None else (),
+    )
+
+
 def _apply_replay_cleanup(result: Any, cleanup: Any, recorder: EventRecorder) -> Any:
-    """Make forced or abnormal stdio cleanup visible in replay reports."""
+    """Make abnormal target cleanup and trailing traffic visible in replay reports."""
 
     from .report import EvidenceRef, Finding, RunError
     from .transports import CleanupResult
 
+    if isinstance(cleanup, int) and not isinstance(cleanup, bool):
+        replay_complete_sequences = [
+            event["seq"]
+            for event in recorder.events
+            if event.get("classification") == "replay_complete"
+            and isinstance(event.get("seq"), int)
+        ]
+        replay_complete_sequence = (
+            replay_complete_sequences[-1] if replay_complete_sequences else None
+        )
+        explicit_termination = any(
+            event.get("classification") == "session_terminated"
+            and event.get("httpStatus") == cleanup
+            and isinstance(event.get("seq"), int)
+            and replay_complete_sequence is not None
+            and event["seq"] < replay_complete_sequence
+            for event in recorder.events
+        )
+        if explicit_termination:
+            # The DELETE was a captured replay action. Its status was already
+            # compared with the source; close() merely returns the cached
+            # result and must not reinterpret a reproduced 4xx/5xx as a new
+            # automatic-cleanup transport failure.
+            return result
+        if 200 <= cleanup < 300 or cleanup == 405:
+            return result
+        evidence_name = recorder.last_reference()
+        evidence = (EvidenceRef(evidence_name),) if evidence_name is not None else ()
+        details = f"HTTP session termination returned status {cleanup}."
+        failure = Finding(
+            code="REPLAY_COMPLETE" if result.matches_source else "HTTP_SESSION_TERMINATION",
+            status="FAIL",
+            category="replay" if result.matches_source else "transport",
+            basis="operational",
+            summary="Replay protocol traffic completed, but HTTP session cleanup failed.",
+            details=details,
+            expected={"cleanupStatus": "2xx or 405"},
+            actual={"cleanupStatus": cleanup},
+            evidence=evidence,
+        )
+        findings = (
+            tuple(
+                failure if finding.code == "REPLAY_COMPLETE" else finding
+                for finding in result.findings
+            )
+            if result.matches_source
+            else result.findings + (failure,)
+        )
+        return replace(
+            result,
+            matches_source=False,
+            findings=findings,
+            errors=result.errors
+            + (
+                RunError(
+                    code="TRANSPORT_HTTP_IO",
+                    kind="transport",
+                    summary="Replay HTTP session cleanup failed.",
+                    details=details,
+                    evidence=evidence,
+                ),
+            ),
+        )
     if not isinstance(cleanup, CleanupResult):
         return result
+
+    complete_sequences = [
+        event.get("seq")
+        for event in recorder.events
+        if event.get("classification") == "replay_complete"
+        and isinstance(event.get("seq"), int)
+    ]
+    completed_sequence = complete_sequences[-1] if complete_sequences else None
+    trailing = [
+        event
+        for event in recorder.events
+        if completed_sequence is not None
+        and event.get("direction") == "server_to_client"
+        and isinstance(event.get("seq"), int)
+        and event["seq"] > completed_sequence
+    ]
     status: str | None = None
     details: str | None = None
     error_summary: str | None = None
@@ -726,41 +1103,59 @@ def _apply_replay_cleanup(result: Any, cleanup: Any, recorder: EventRecorder) ->
             "the replay interaction."
         )
         error_summary = "Replay target exited with a non-zero status."
-    if status is None:
+    if status is None and not trailing:
         return result
 
-    evidence_name = recorder.last_reference()
-    evidence = (EvidenceRef(evidence_name),) if evidence_name is not None else ()
-    findings = tuple(
-        Finding(
-            code="REPLAY_COMPLETE",
-            status=status,
-            category="replay",
-            basis="operational",
-            summary=(
-                "Replay traffic matched, but target cleanup required SIGTERM."
-                if status == "WARN"
-                else "Replay protocol traffic completed, but target cleanup failed."
-            ),
-            details=details,
-            expected={
-                "sentActions": result.planned_actions,
-                "completed": True,
-                "responseComparisons": "all match",
-                "cleanup": "graceful exit 0",
-            },
-            actual={
-                "protocolMatch": result.matches_source,
-                "cleanupExitCode": cleanup.returncode,
-                "terminated": cleanup.terminated,
-                "killed": cleanup.killed,
-            },
-            evidence=evidence,
+    if trailing and status is None:
+        status = "FAIL"
+        details = (
+            f"The stdio target emitted {len(trailing)} protocol message(s) after "
+            "the replay had reached its captured endpoint."
         )
-        if finding.code == "REPLAY_COMPLETE"
-        else finding
-        for finding in result.findings
+        error_summary = None
+
+    evidence_names = [f"event:{event['seq']}" for event in trailing]
+    evidence_name = recorder.last_reference()
+    if evidence_name is not None and evidence_name not in evidence_names:
+        evidence_names.append(evidence_name)
+    evidence = tuple(EvidenceRef(item) for item in evidence_names)
+    cleanup_finding = Finding(
+        code="REPLAY_COMPLETE" if result.matches_source else "STDIO_CLEANUP",
+        status=status,
+        category="replay" if result.matches_source else "transport",
+        basis="operational",
+        summary=(
+            "Replay traffic matched, but target cleanup required SIGTERM."
+            if status == "WARN" and result.matches_source
+            else (
+                "Replay protocol traffic completed, but target cleanup failed."
+                if result.matches_source
+                else "Replay target cleanup was not graceful after an earlier failure."
+            )
+        ),
+        details=details,
+        expected={
+            "sentActions": result.planned_actions,
+            "completed": True,
+            "responseComparisons": "all match",
+            "cleanup": "graceful exit 0",
+        },
+        actual={
+            "protocolMatch": result.matches_source,
+            "cleanupExitCode": cleanup.returncode,
+            "terminated": cleanup.terminated,
+            "killed": cleanup.killed,
+            "trailingMessages": len(trailing),
+        },
+        evidence=evidence,
     )
+    if result.matches_source:
+        findings = tuple(
+            cleanup_finding if finding.code == "REPLAY_COMPLETE" else finding
+            for finding in result.findings
+        )
+    else:
+        findings = result.findings + (cleanup_finding,)
     errors = result.errors
     if error_summary is not None:
         errors = errors + (
@@ -775,6 +1170,9 @@ def _apply_replay_cleanup(result: Any, cleanup: Any, recorder: EventRecorder) ->
     return replace(
         result,
         matches_source=result.matches_source if status == "WARN" else False,
+        received_messages=result.received_messages + len(trailing),
+        evidence=result.evidence
+        + tuple(item for item in evidence_names if item not in result.evidence),
         findings=findings,
         errors=errors,
     )
@@ -787,13 +1185,15 @@ def _add_protocol_args(
     include_client: bool = True,
     include_version: bool = True,
     include_initialize_payload: bool = True,
+    scenario_timeout: bool = False,
 ) -> None:
     if include_version:
         parser.add_argument(
             "--protocol-version",
             default=default_version,
             help=(
-                "Dated MCP protocol profile (inferred from the transcript by default)."
+                "Dated MCP protocol profile (inferred from transcript metadata when "
+                f"present; otherwise defaults to {LATEST_PROTOCOL_VERSION})."
                 if default_version is None
                 else f"Dated MCP protocol profile (default: {default_version})."
             ),
@@ -822,10 +1222,11 @@ def _add_protocol_args(
     parser.add_argument(
         "--timeout",
         type=float,
-        default=15.0,
+        default=None if scenario_timeout else 15.0,
         help=(
-            "Per-operation timeout in seconds (default: 15; a scenario file's "
-            "default applies when this option is omitted)."
+            "Override the scenario file's default operation timeout."
+            if scenario_timeout
+            else "Per-operation timeout in seconds (default: 15)."
         ),
     )
     parser.add_argument(
@@ -923,6 +1324,7 @@ def _add_laboratory_leaf(
         include_client=command != "replay",
         include_version=command != "matrix",
         include_initialize_payload=command != "matrix",
+        scenario_timeout=command == "scenario",
     )
     _add_output_args(parser)
     if command in {"check", "matrix"}:
@@ -942,7 +1344,6 @@ def _add_laboratory_leaf(
     if command == "scenario":
         # An omitted CLI timeout lets the scenario's top-level timeout apply;
         # individual action timeouts remain most specific.
-        parser.set_defaults(timeout=None)
         parser.add_argument("--file", required=True, help="Scenario JSON file.")
         parser.add_argument(
             "--allow-tool",

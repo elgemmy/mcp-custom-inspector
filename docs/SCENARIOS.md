@@ -151,6 +151,9 @@ permissive server parser). Probe therefore blocks opaque malformed wire by
 default. Add `--allow-opaque-wire` only after reviewing the target and exact
 bytes; the report records `SAFETY_OPAQUE_WIRE_OPT_IN`. Strictly decoded JSON
 tool calls still require the exact `--allow-tool NAME` independently.
+Transport-level headers participate in this decision: a configured non-identity
+`Content-Encoding` or non-JSON effective Content-Type makes an HTTP raw action
+opaque even when the action itself says `application/json`.
 
 A malformed input experiment may itself violate a client's transport
 obligation. Record the observed robustness result, but do not label every
@@ -184,6 +187,9 @@ marked `active: true` in the report. Ambiguous malformed text that resembles
 `tools/call` is blocked even with an allow-list because Probe cannot verify an
 exact target name. Raw ordinary inspection remains an intentionally explicit
 wire-control interface; review any `tools/call` payload before sending it.
+Automated `connect`/`establish` also rejects custom initialize data or client
+capabilities that contain a nested or normalized `tools/call`-like value; put
+an authorized call in its own explicit scenario action instead.
 
 ## Results and exit behavior
 

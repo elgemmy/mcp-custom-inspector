@@ -23,6 +23,7 @@ from .report import (
     RunError,
 )
 from .schema_inspection import SchemaIssue, inspect_tool_schemas
+from .safety import find_active_tool_calls
 from .session import McpSession, PaginationResult, SessionConfig
 from .transports import CleanupResult, HttpExchange, HttpTransport, InboundMessage, StdioTransport
 from .transcript import EventRecorder
@@ -41,9 +42,11 @@ _INVALID_STDIO_CLASSES = {
 }
 
 
-def _typed_rpc_key(value: Any) -> tuple[str, str | int] | None:
+def _typed_rpc_key(value: Any) -> tuple[str, str | int | float] | None:
     if type(value) is int:
         return ("int", value)
+    if isinstance(value, float) and math.isfinite(value):
+        return ("float", value)
     if isinstance(value, str):
         return ("str", value)
     return None
@@ -172,6 +175,14 @@ def run_check(
     every other active primitive are deliberately absent.
     """
 
+    if find_active_tool_calls(
+        session.config.initialize_message
+    ) or find_active_tool_calls(session.config.client_capabilities):
+        raise ConfigurationError(
+            "Compatibility checks cannot establish a session with active "
+            "tools/call-like lifecycle data. Use an explicitly authorized "
+            "scenario action for active tool testing."
+        )
     options = CheckOptions(timeout, max_pages, notification_observation_window, close)
     return _CheckRun(session, options).execute()
 
@@ -962,7 +973,7 @@ class _CheckRun:
             )
 
     def _add_notification_findings(self) -> None:
-        outstanding: dict[tuple[str, str | int], dict[str, Any]] = {}
+        outstanding: dict[tuple[str, str | int | float], dict[str, Any]] = {}
         progress: list[tuple[dict[str, Any], bool]] = []
         logging: list[tuple[dict[str, Any], bool]] = []
         changes: list[tuple[dict[str, Any], str, str, bool]] = []
@@ -1883,7 +1894,28 @@ class _CheckRun:
 
         self._check_http_request_headers()
         assigned = [event for event in events if event.get("classification") == "session_assigned"]
-        if assigned:
+        invalid_sessions = [
+            event
+            for event in events
+            if event.get("classification")
+            in {"invalid_session_id", "unexpected_session_id"}
+        ]
+        if invalid_sessions:
+            self._add(
+                "HTTP_SESSION_ID",
+                "FAIL",
+                "The server returned an invalid or lifecycle-incompatible MCP session ID.",
+                expected=(
+                    "no MCP-Session-Id for this protocol era"
+                    if self.session.profile.modern
+                    else "a valid visible-ASCII MCP-Session-Id"
+                ),
+                actual=[event.get("classification") for event in invalid_sessions],
+                evidence=tuple(
+                    self._event_ref(event) for event in invalid_sessions
+                ),
+            )
+        elif assigned:
             assigned_seq = assigned[0]["seq"]
             subsequent = [
                 event
@@ -2107,7 +2139,7 @@ class _CheckRun:
         )
 
     def _response_id_anomalies(self) -> list[dict[str, Any]]:
-        outstanding: dict[tuple[str, str | int], int] = {}
+        outstanding: dict[tuple[str, str | int | float], int] = {}
         anomalies: list[dict[str, Any]] = []
         events = self._events
         for index, event in enumerate(events):

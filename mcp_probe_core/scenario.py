@@ -19,12 +19,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-from .errors import ConfigurationError, ProbeTimeout, ProcessExited, TransportError
+from .errors import (
+    ConfigurationError,
+    HttpExchangeError,
+    ProbeTimeout,
+    ProcessExited,
+    TransportError,
+)
 from .io_safety import InputLimitError, read_utf8_limited
 from .protocol import make_notification
 from .protocol import strict_json_loads
 from .redaction import redact_headers, redact_raw, redact_value
 from .report import EvidenceRef, Finding, RunError
+from .safety import find_active_tool_calls, resembles_tools_call_method
 from .session import McpSession, PaginationResult, RpcOutcome
 from .transports import (
     CleanupResult,
@@ -186,6 +193,18 @@ def run_scenario(
         raise ConfigurationError("Allowed tool names must be non-empty strings.")
     if not isinstance(allow_opaque_wire, bool):
         raise ConfigurationError("allow_opaque_wire must be a boolean.")
+    establishes = any(
+        action.get("action") in {"start", "connect"} and action.get("establish")
+        for action in scenario.actions
+    )
+    if (
+        establishes and find_active_tool_calls(session.config.initialize_message)
+    ) or find_active_tool_calls(session.config.client_capabilities):
+        raise ConfigurationError(
+            "Scenario execution cannot use active tools/call-like "
+            "lifecycle payload. Put the call in an exact action and authorize "
+            "its literal tool name explicitly."
+        )
     return ScenarioRunner(
         session,
         scenario,
@@ -232,7 +251,9 @@ class ScenarioRunner:
     def run(self) -> ScenarioRunResult:
         started = time.monotonic()
         original_handler = self.session.transport.server_request_handler
+        original_auto_respond = self.session.auto_respond_server_requests
         if not self.scenario.auto_respond_server_requests:
+            self.session.auto_respond_server_requests = False
             self.session.transport.server_request_handler = None
         try:
             # Connecting the transport is implicit.  An explicit start/connect
@@ -242,6 +263,7 @@ class ScenarioRunner:
         except TransportError as exc:
             self._add_transport_error(exc, during_start=True)
             self._disconnect(implicit=True)
+            self.session.auto_respond_server_requests = original_auto_respond
             self.session.transport.server_request_handler = original_handler
             return self._result(started)
 
@@ -281,6 +303,7 @@ class ScenarioRunner:
                 self._add_transport_error(self.last_fault)
             if not self.disconnected:
                 self._disconnect(implicit=True)
+            self.session.auto_respond_server_requests = original_auto_respond
             self.session.transport.server_request_handler = original_handler
         return self._result(started)
 
@@ -324,6 +347,14 @@ class ScenarioRunner:
         if action["establish"]:
             try:
                 outcome = self.session.establish(self._timeout(action))
+            except HttpExchangeError as exc:
+                if exc.finding_code == "HTTP_RESPONSE_TIMEOUT":
+                    self._remember_http_exchange_timeout(exc)
+                    evidence = _evidence(self.last_fault_evidence)
+                else:
+                    self._remember_http_exchange_error(exc)
+                    self._protocol_exchange_failure(index, exc)
+                    return
             except TransportError as exc:
                 self._capture_fault(exc)
             else:
@@ -332,6 +363,11 @@ class ScenarioRunner:
                 self.last_value = outcome.response.payload
                 self._store_value(self.last_value)
                 evidence = _evidence(*outcome.evidence)
+            finally:
+                # Legacy establishment installs the session's default handler.
+                # Preserve the scenario's explicit raw-observation policy.
+                if not self.scenario.auto_respond_server_requests:
+                    self.session.transport.server_request_handler = None
         self._step_finding(
             index,
             "Connected to the target"
@@ -347,6 +383,14 @@ class ScenarioRunner:
             outcome = self.session.rpc(
                 action["method"], action.get("params"), self._timeout(action)
             )
+        except HttpExchangeError as exc:
+            if exc.finding_code == "HTTP_RESPONSE_TIMEOUT":
+                self._remember_http_exchange_timeout(exc)
+                evidence = _evidence(self.last_fault_evidence)
+            else:
+                self._remember_http_exchange_error(exc)
+                self._protocol_exchange_failure(index, exc)
+                return
         except TransportError as exc:
             self._capture_fault(exc)
             evidence = _evidence(self.last_fault_evidence)
@@ -357,7 +401,7 @@ class ScenarioRunner:
             index,
             f"Sent request {action['method']}",
             evidence=evidence,
-            active=_resembles_tools_call_method(action["method"]),
+            active=resembles_tools_call_method(action["method"]),
         )
 
     def _notification(self, index: int, action: dict[str, Any]) -> None:
@@ -385,6 +429,14 @@ class ScenarioRunner:
                 self.awaiting_observation = action["wait"]
                 if action["wait"]:
                     self._receive_stdio(self._timeout(action))
+        except HttpExchangeError as exc:
+            if exc.finding_code == "HTTP_RESPONSE_TIMEOUT":
+                self._remember_http_exchange_timeout(exc)
+                evidence_ref = self.last_fault_evidence
+            else:
+                self._remember_http_exchange_error(exc)
+                self._protocol_exchange_failure(index, exc)
+                return
         except TransportError as exc:
             self._capture_fault(exc)
             evidence_ref = self.last_fault_evidence
@@ -392,7 +444,7 @@ class ScenarioRunner:
             index,
             f"Sent notification {action['method']}",
             evidence=_evidence(evidence_ref),
-            active=_resembles_tools_call_method(action["method"]),
+            active=resembles_tools_call_method(action["method"]),
         )
 
     def _exact(self, index: int, action: dict[str, Any]) -> None:
@@ -426,7 +478,7 @@ class ScenarioRunner:
             index,
             "Sent exact JSON-RPC object",
             evidence=_evidence(evidence),
-            active=bool(_find_tool_call_objects(message)),
+            active=bool(find_active_tool_calls(message)),
         )
 
     def _malformed(self, index: int, action: dict[str, Any]) -> None:
@@ -436,26 +488,23 @@ class ScenarioRunner:
             data = base64.b64decode(action["data"], validate=True)
         else:
             data = action["data"]
-        content_encoding = next(
-            (
-                value
-                for key, value in action["headers"].items()
-                if key.lower() == "content-encoding"
-            ),
-            None,
+        effective_headers = {"content-type": action["contentType"]}
+        if isinstance(self.session.transport, HttpTransport):
+            effective_headers.update(
+                {
+                    key.lower(): value
+                    for key, value in self.session.transport.extra_headers.items()
+                }
+            )
+        effective_headers.update(
+            {key.lower(): value for key, value in action["headers"].items()}
         )
+        content_encoding = effective_headers.get("content-encoding")
         opaque_transport_encoding = (
             content_encoding is not None
             and content_encoding.strip().lower() != "identity"
         )
-        effective_content_type = next(
-            (
-                value
-                for key, value in action["headers"].items()
-                if key.lower() == "content-type"
-            ),
-            action["contentType"],
-        )
+        effective_content_type = effective_headers["content-type"]
         media_type, _, parameters = effective_content_type.partition(";")
         safe_json_media = media_type.strip().lower() == "application/json"
         if parameters:
@@ -511,6 +560,7 @@ class ScenarioRunner:
         expected: Any = kind
         actual: Any = self._actual_summary()
         evidence_ref = self._current_evidence()
+        assertion_source: Any = _MISSING
 
         if kind == "result":
             if (
@@ -522,6 +572,7 @@ class ScenarioRunner:
             payload = self.last_response.payload if self.last_response else None
             matched = isinstance(payload, dict) and "result" in payload and "error" not in payload
             actual = payload
+            assertion_source = payload
             evidence_ref = self._current_evidence()
         elif kind == "error":
             if (
@@ -533,6 +584,7 @@ class ScenarioRunner:
             payload = self.last_response.payload if self.last_response else None
             matched = isinstance(payload, dict) and isinstance(payload.get("error"), dict)
             actual = payload
+            assertion_source = payload
             evidence_ref = self._current_evidence()
             if matched and action.get("code") is not None:
                 expected = {"errorCode": action["code"]}
@@ -543,7 +595,11 @@ class ScenarioRunner:
             if self.last_fault is None and self.awaiting_observation:
                 self._observe_for_expectation(self._timeout(action))
             matched = isinstance(self.last_fault, ProbeTimeout)
-            actual = type(self.last_fault).__name__ if self.last_fault else self._actual_summary()
+            actual = (
+                type(self.last_fault).__name__
+                if self.last_fault
+                else self._actual_summary()
+            )
             if matched:
                 self.last_fault = None
                 self.last_fault_evidence = None
@@ -555,6 +611,7 @@ class ScenarioRunner:
             expected = {"serverRequest": action.get("method") or "any"}
             actual = request.payload if request else self._actual_summary()
             if request:
+                assertion_source = request.payload
                 self.last_value = request.payload
                 self._store_value(request.payload)
                 evidence_ref = request.evidence
@@ -616,11 +673,7 @@ class ScenarioRunner:
         if not matched and self.last_fault is not None:
             self._add_transport_error(self.last_fault)
         if matched and action["assertions"]:
-            source = (
-                self.last_response.payload
-                if self.last_response is not None
-                else self.last_value
-            )
+            source = actual if assertion_source is _MISSING else assertion_source
             self._evaluate_assertions(index, action["assertions"], source, evidence_ref)
         if matched and kind in {"result", "error"}:
             self.last_response = (
@@ -651,6 +704,14 @@ class ScenarioRunner:
                 )
                 value = _pagination_value(result)
                 responses = result.responses
+        except HttpExchangeError as exc:
+            if exc.finding_code == "HTTP_RESPONSE_TIMEOUT":
+                self._remember_http_exchange_timeout(exc)
+                evidence = self.last_fault_evidence
+            else:
+                self._remember_http_exchange_error(exc)
+                self._protocol_exchange_failure(index, exc)
+                return
         except TransportError as exc:
             self._capture_fault(exc)
             evidence = self.last_fault_evidence
@@ -860,6 +921,22 @@ class ScenarioRunner:
 
     def _remember_exchange(self, exchange: HttpExchange) -> None:
         self.last_exchange = exchange
+        if exchange.timed_out:
+            self._capture_fault(
+                ProbeTimeout("HTTP response body timed out before completion.")
+            )
+            self.last_exchange = exchange
+            self.last_value = _exchange_value(exchange, self.session.recorder)
+            self._store_value(self.last_value)
+            return
+        if not exchange.body_complete:
+            self._capture_fault(
+                TransportError("HTTP response body framing was incomplete or invalid.")
+            )
+            self.last_exchange = exchange
+            self.last_value = _exchange_value(exchange, self.session.recorder)
+            self._store_value(self.last_value)
+            return
         responses = [item for item in exchange.messages if item.classification == "response"]
         self.last_response = responses[0] if responses else None
         self.pending_http_responses = responses[1:]
@@ -869,6 +946,65 @@ class ScenarioRunner:
             else _exchange_value(exchange, self.session.recorder)
         )
         self._store_value(self.last_value)
+
+    def _remember_http_exchange_timeout(self, error: HttpExchangeError) -> None:
+        self.last_exchange = error.exchange
+        self._capture_fault(ProbeTimeout(str(error)))
+        self.last_exchange = error.exchange
+        self.last_value = _exchange_value(error.exchange, self.session.recorder)
+        self._store_value(self.last_value)
+
+    def _remember_http_exchange_error(self, error: HttpExchangeError) -> None:
+        """Retain protocol evidence from a valid but uncorrelated HTTP exchange."""
+
+        self.last_exchange = error.exchange
+        self.last_response = None
+        self.pending_http_responses = []
+        observed = next(
+            (
+                item
+                for item in error.exchange.messages
+                if item.classification == "response"
+            ),
+            None,
+        )
+        self.last_fault = None
+        self.last_fault_evidence = (
+            observed.evidence
+            if observed is not None
+            else self.session.recorder.last_reference()
+        )
+        self.last_value = {
+            "error": {
+                "code": error.finding_code,
+                "message": self.session.recorder.redact_text(str(error)),
+            },
+            "observed": (
+                observed.payload
+                if observed is not None
+                else _exchange_value(error.exchange, self.session.recorder)
+            ),
+        }
+        self._store_value(self.last_value)
+
+    def _protocol_exchange_failure(
+        self, index: int, error: HttpExchangeError
+    ) -> None:
+        self.findings.append(
+            Finding(
+                code="SCENARIO_STEP",
+                status="FAIL",
+                category="scenario",
+                basis="operational",
+                summary=(
+                    f"Step {index}: HTTP response could not be accepted."
+                ),
+                details=self.session.recorder.redact_text(str(error)),
+                expected={"correlatedResponse": True},
+                actual=self.last_value,
+                evidence=_evidence(self.last_fault_evidence),
+            )
+        )
 
     def _remember_inbound(self, inbound: InboundMessage) -> None:
         self.last_value = inbound.payload
@@ -958,7 +1094,7 @@ class ScenarioRunner:
         method: str | None,
         params: Mapping[str, Any] | None,
     ) -> bool:
-        if not _resembles_tools_call_method(method):
+        if not resembles_tools_call_method(method):
             return True
         name = params.get("name") if isinstance(params, Mapping) else None
         if isinstance(name, str) and name in self.allow_tools:
@@ -998,14 +1134,9 @@ class ScenarioRunner:
         remains available after an exact per-tool opt-in.
         """
 
-        calls = _find_tool_call_objects(value)
-        for call in calls:
-            params = call.get("params")
-            if not self._authorize_tool_call(
-                index,
-                str(call.get("method")),
-                params if isinstance(params, Mapping) else None,
-            ):
+        for name in find_active_tool_calls(value):
+            params = {"name": name} if isinstance(name, str) else None
+            if not self._authorize_tool_call(index, "tools/call", params):
                 return False
         return True
 
@@ -1027,14 +1158,8 @@ class ScenarioRunner:
             except (json.JSONDecodeError, ValueError):
                 parsed = _MISSING
 
-        calls = _find_tool_call_objects(parsed)
-        if calls:
-            names = [
-                item["params"].get("name")
-                if isinstance(item.get("params"), dict)
-                else None
-                for item in calls
-            ]
+        names = find_active_tool_calls(parsed)
+        if names:
             invalid = next(
                 (
                     name
@@ -1509,6 +1634,7 @@ def _exchange_value(exchange: HttpExchange, recorder: Any) -> dict[str, Any]:
         "body": recorder.redact_raw(exchange.body),
         "parseIssues": [recorder.redact_text(item) for item in exchange.parse_issues],
         "timedOut": exchange.timed_out,
+        "bodyComplete": exchange.body_complete,
     }
 
 
@@ -1524,26 +1650,6 @@ def _method_matches(inbound: InboundMessage, method: str | None) -> bool:
     if method is None:
         return True
     return isinstance(inbound.payload, dict) and inbound.payload.get("method") == method
-
-
-def _resembles_tools_call_method(value: Any) -> bool:
-    return isinstance(value, str) and value.strip().casefold() == "tools/call"
-
-
-def _find_tool_call_objects(value: Any) -> list[Mapping[str, Any]]:
-    """Recursively find tool-call-like objects in decoded wire data."""
-
-    found: list[Mapping[str, Any]] = []
-    stack = [value]
-    while stack:
-        current = stack.pop()
-        if isinstance(current, Mapping):
-            if _resembles_tools_call_method(current.get("method")):
-                found.append(current)
-            stack.extend(current.values())
-        elif isinstance(current, list):
-            stack.extend(current)
-    return found
 
 
 _JSON_STRING_TOKEN = re.compile(r'"(?:\\.|[^"\\])*"')
@@ -1572,7 +1678,7 @@ def _raw_resembles_tools_call(text: str) -> bool:
             between = text[end:value_start]
             if ":" not in between:
                 continue
-            if _resembles_tools_call_method(candidate):
+            if resembles_tools_call_method(candidate):
                 return True
             break
     # Also guard intentionally non-JSON single-quoted inputs.

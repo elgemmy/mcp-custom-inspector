@@ -9,10 +9,11 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
-from .errors import ConfigurationError, ProbeTimeout, TransportError
+from .errors import ConfigurationError, HttpExchangeError, ProbeTimeout, TransportError
 from .protocol import (
     JsonObject,
     ProtocolProfile,
+    classify_message,
     decorate_modern_request,
     encode_mcp_header_value,
     make_initialize_request,
@@ -114,6 +115,7 @@ class McpSession:
         self._initialized_notification_sent = False
         self._pagination_total_bytes = 0
         self._pagination_total_items = 0
+        self.auto_respond_server_requests = True
         if isinstance(self.transport, StdioTransport):
             self.transport.profile = self.profile
         self._install_server_request_handler()
@@ -168,7 +170,7 @@ class McpSession:
         request_id = message_id(initialize)
         if request_id is None:
             raise ConfigurationError(
-                "The initialize request must use a string or integer id for automatic correlation."
+                "The initialize request must use a finite number or string id for automatic correlation."
             )
         outcome = self.send_exact_request(initialize, timeout)
         response = outcome.response
@@ -231,7 +233,7 @@ class McpSession:
         request_id = message_id(message)
         if request_id is None:
             raise ConfigurationError(
-                "Automatic request correlation requires a string or integer JSON-RPC id."
+                "Automatic request correlation requires a finite number or string JSON-RPC id."
             )
         if isinstance(self.transport, StdioTransport):
             self.transport.send_message(message, timeout)
@@ -242,14 +244,26 @@ class McpSession:
             timeout,
             derived_headers=transport_headers,
         )
+        if exchange.timed_out:
+            raise HttpExchangeError(
+                f"HTTP response body timed out before response id={request_id!r} "
+                "could be accepted.",
+                exchange,
+                finding_code="HTTP_RESPONSE_TIMEOUT",
+            )
+        if not exchange.body_complete:
+            raise HttpExchangeError(
+                f"HTTP response body framing was incomplete or invalid for "
+                f"response id={request_id!r}.",
+                exchange,
+                finding_code="HTTP_RESPONSE_FRAMING",
+            )
         response = _matching_http_response(exchange, request_id)
         if response is None:
-            if exchange.timed_out:
-                raise ProbeTimeout(
-                    f"HTTP stream timed out waiting for response id={request_id!r}."
-                )
-            raise TransportError(
-                f"HTTP exchange contained no response matching id={request_id!r}."
+            raise HttpExchangeError(
+                f"HTTP exchange contained no response matching id={request_id!r}.",
+                exchange,
+                finding_code="HTTP_RESPONSE_CORRELATION",
             )
         self._service_http_server_requests(exchange, timeout)
         return RpcOutcome(response, exchange)
@@ -264,19 +278,26 @@ class McpSession:
         """Send a payload without adding MCP metadata or changing its ID."""
         if isinstance(self.transport, StdioTransport):
             evidence = self.transport.send_message(message, timeout)
+            if classify_message(message) != "request":
+                return evidence
             request_id = message_id(message)
             if request_id is None:
-                return evidence
+                # Raw-wire mode deliberately permits MCP-invalid/unusual IDs
+                # which cannot enter the normal typed correlation map.  Keep
+                # the old probe behavior by surfacing the next peer message.
+                return RpcOutcome(self.transport.receive(timeout))
             return RpcOutcome(self.transport.wait_for_response(request_id, timeout))
         exchange = self.transport.send_message(message, timeout)
+        if classify_message(message) != "request":
+            return exchange
         request_id = message_id(message)
         if request_id is None:
             return exchange
         response = _matching_http_response(exchange, request_id)
         if response is None:
-            raise TransportError(
-                f"HTTP exchange contained no response matching id={request_id!r}."
-            )
+            # Exact raw-wire probing must expose wrong-ID, malformed, and empty
+            # HTTP exchanges rather than convert the evidence into an exception.
+            return exchange
         return RpcOutcome(response, exchange)
 
     def paginate(
@@ -407,6 +428,9 @@ class McpSession:
         return self.transport.next_id()
 
     def _install_server_request_handler(self) -> None:
+        if not self.auto_respond_server_requests:
+            self.transport.server_request_handler = None
+            return
         if self.profile.modern and self.config.initialize_message is None:
             self.transport.server_request_handler = self._reject_modern_server_request
         else:
@@ -440,9 +464,9 @@ class McpSession:
             and ("params" not in message or isinstance(params, (dict, list)))
         )
         if not valid:
-            response_id: str | int | None = (
+            response_id: str | int | float | None = (
                 raw_request_id
-                if type(raw_request_id) is int or isinstance(raw_request_id, str)
+                if message_id({"id": raw_request_id}) is not None
                 else None
             )
             self.recorder.record(
@@ -523,7 +547,9 @@ class McpSession:
         return _schema_argument_headers(tool["inputSchema"], arguments)
 
 
-def _matching_http_response(exchange: HttpExchange, request_id: str | int) -> InboundMessage | None:
+def _matching_http_response(
+    exchange: HttpExchange, request_id: str | int | float
+) -> InboundMessage | None:
     wanted_type = type(request_id)
     for message in exchange.messages:
         if message.classification != "response" or not isinstance(message.payload, dict):

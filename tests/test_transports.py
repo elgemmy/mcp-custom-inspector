@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import socket
+import socketserver
 import sys
 import tempfile
 import textwrap
@@ -17,9 +18,16 @@ from threading import Thread
 from typing import Any, Iterator
 from unittest import mock
 
-from mcp_probe_core.errors import ProbeTimeout, ProcessExited, TransportError
+from mcp_probe_core.errors import (
+    ConfigurationError,
+    HttpExchangeError,
+    ProbeTimeout,
+    ProcessExited,
+    TransportError,
+)
 from mcp_probe_core.protocol import make_notification, make_request, profile_for
 from mcp_probe_core.redaction import REDACTED
+from mcp_probe_core.session import McpSession, SessionConfig
 from mcp_probe_core.transcript import EventRecorder
 from mcp_probe_core.transports import (
     HttpTransport,
@@ -103,6 +111,47 @@ def running_http_handler(
     thread.start()
     try:
         yield f"http://127.0.0.1:{server.server_port}/mcp"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@contextlib.contextmanager
+def running_raw_http_responses(
+    responses: list[bytes | tuple[bytes, float]]
+) -> Iterator[str]:
+    pending = list(responses)
+    pending_lock = threading.Lock()
+
+    class Handler(socketserver.BaseRequestHandler):
+        def handle(self) -> None:
+            self.request.settimeout(1)
+            received = b""
+            while b"\r\n\r\n" not in received:
+                chunk = self.request.recv(4096)
+                if not chunk:
+                    break
+                received += chunk
+            with pending_lock:
+                response = pending.pop(0)
+            if isinstance(response, tuple):
+                payload, hold_open = response
+            else:
+                payload, hold_open = response, 0.0
+            self.request.sendall(payload)
+            if hold_open:
+                time.sleep(hold_open)
+
+    class Server(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    server = Server(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/mcp"
     finally:
         server.shutdown()
         server.server_close()
@@ -254,6 +303,56 @@ class StdioTransportTests(unittest.TestCase):
         self.assertEqual(cleanup.returncode, 0)
         self.assertTrue(cleanup.graceful)
 
+    def test_cleanup_drains_large_post_eof_stderr_before_waiting_for_exit(self) -> None:
+        script = textwrap.dedent(
+            """
+            import json, sys
+            message = json.loads(sys.stdin.buffer.readline())
+            print(json.dumps({
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "serverInfo": {"name": "post-eof-stderr", "version": "1"},
+                },
+            }), flush=True)
+            for _line in sys.stdin.buffer:
+                pass
+            for _index in range(512):
+                sys.stderr.write("x" * 1024 + "\\n")
+            sys.stderr.flush()
+            """
+        )
+        recorder = EventRecorder()
+        transport = StdioTransport(
+            [sys.executable, "-u", "-c", script],
+            {},
+            recorder,
+            shutdown_timeout=1.0,
+        )
+        transport.start()
+        transport.send_message(initialize_request())
+        self.assertEqual(transport.wait_for_response(1, 1).payload["id"], 1)
+
+        cleanup = transport.close()
+
+        stderr_events = [
+            event
+            for event in recorder.events
+            if event.get("classification") == "stderr"
+        ]
+        self.assertEqual(len(stderr_events), 512)
+        self.assertEqual(cleanup.returncode, 0)
+        self.assertTrue(cleanup.graceful)
+        self.assertFalse(cleanup.terminated)
+        self.assertFalse(
+            any(
+                event.get("classification") == "process_terminate"
+                for event in recorder.events
+            )
+        )
+
     def test_malformed_json_and_non_utf8_are_evidenced_once_then_valid_response_wins(self) -> None:
         for profile, expected_class in (
             ("stdio-malformed-output", "invalid_json"),
@@ -314,6 +413,90 @@ class StdioTransportTests(unittest.TestCase):
             cleanup = transport.close()
         self.assertEqual(cleanup.returncode, 23)
 
+    def test_child_exit_is_prompt_when_descendant_keeps_stdio_pipes_open(self) -> None:
+        script = textwrap.dedent(
+            """
+            import os, subprocess, sys
+            sys.stdin.buffer.readline()
+            subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            os._exit(17)
+            """
+        )
+        recorder = EventRecorder()
+        transport = StdioTransport(
+            [sys.executable, "-u", "-c", script], {}, recorder
+        )
+        transport.start()
+        started = time.monotonic()
+        try:
+            transport.send_message(initialize_request())
+            with self.assertRaises(ProcessExited) as raised:
+                transport.wait_for_response(1, 1.5, cancel_on_timeout=False)
+            self.assertLess(time.monotonic() - started, 0.75)
+            self.assertIn("exit 17", str(raised.exception))
+        finally:
+            cleanup = transport.close()
+        self.assertEqual(cleanup.returncode, 17)
+        self.assertTrue(cleanup.terminated)
+
+    def test_exit_zero_launcher_can_delegate_to_cooperative_inherited_worker(self) -> None:
+        worker = textwrap.dedent(
+            """
+            import json, sys
+            for line in sys.stdin.buffer:
+                message = json.loads(line)
+                if "id" not in message:
+                    continue
+                if message.get("method") == "initialize":
+                    result = {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "serverInfo": {"name": "worker", "version": "1"},
+                    }
+                else:
+                    result = {}
+                print(json.dumps({
+                    "jsonrpc": "2.0", "id": message["id"], "result": result
+                }), flush=True)
+            """
+        )
+        launcher = textwrap.dedent(
+            f"""
+            import os, subprocess, sys
+            subprocess.Popen([sys.executable, "-u", "-c", {worker!r}])
+            os._exit(0)
+            """
+        )
+        recorder = EventRecorder()
+        transport = StdioTransport(
+            [sys.executable, "-u", "-c", launcher],
+            {},
+            recorder,
+            shutdown_timeout=1.0,
+        )
+        transport.start()
+        transport.send_message(initialize_request(), timeout=1)
+        initialized = transport.wait_for_response(1, 1)
+        self.assertEqual(initialized.payload["result"]["protocolVersion"], "2025-06-18")
+        transport.send_message(
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            timeout=1,
+        )
+        self.assertEqual(transport.rpc("ping", {}, 1).payload["result"], {})
+
+        cleanup = transport.close()
+
+        self.assertEqual(cleanup.returncode, 0)
+        self.assertTrue(cleanup.graceful)
+        self.assertFalse(cleanup.terminated)
+        self.assertFalse(cleanup.killed)
+        self.assertFalse(
+            any(
+                event.get("classification")
+                in {"process_group_terminate", "process_group_kill"}
+                for event in recorder.events
+            )
+        )
     def test_timeout_records_and_sends_cancellation_for_non_initialize_request(self) -> None:
         recorder = EventRecorder()
         transport = StdioTransport(
@@ -598,6 +781,177 @@ class HttpTransportTests(unittest.TestCase):
             max_body_bytes=max_body_bytes,
         )
 
+    def test_malformed_status_line_is_redacted_transport_error(self) -> None:
+        secret = "malformed-status-private"
+        response = f"NOTHTTP {secret}\x1b[31m\r\n\r\n".encode()
+        with running_raw_http_responses([response]) as url:
+            recorder = EventRecorder()
+            transport = self.make_transport(
+                url,
+                recorder,
+                headers={"Authorization": f"Bearer {secret}"},
+            )
+            with self.assertRaises(TransportError) as raised:
+                transport.send_message(initialize_request(), 0.5)
+        detail = str(raised.exception)
+        self.assertNotIn(secret, detail)
+        self.assertNotIn("\x1b", detail)
+        self.assertIn("\\x1b", detail)
+        error_event = next(
+            event
+            for event in recorder.events
+            if event.get("classification") == "transport_error"
+        )
+        self.assertNotIn(secret, json.dumps(error_event))
+        self.assertNotIn("\x1b", error_event["error"])
+
+    def test_incomplete_http_body_cannot_become_initialize_result(self) -> None:
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": LEGACY_VERSION,
+                    "capabilities": {},
+                    "serverInfo": {"name": "raw", "version": "1"},
+                },
+            },
+            separators=(",", ":"),
+        ).encode()
+        responses = (
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Mcp-Session-Id: hanging-session\r\n\r\n"
+                + body,
+                0.25,
+                "HTTP_RESPONSE_TIMEOUT",
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body) + 50}\r\n".encode()
+                + b"Mcp-Session-Id: truncated-session\r\nConnection: close\r\n\r\n"
+                + body,
+                0.0,
+                "HTTP_RESPONSE_FRAMING",
+            ),
+        )
+        for response, hold_open, expected_code in responses:
+            with self.subTest(expected_code=expected_code), running_raw_http_responses(
+                [(response, hold_open)]
+            ) as url:
+                recorder = EventRecorder()
+                transport = self.make_transport(url, recorder)
+                session = McpSession(
+                    transport,
+                    SessionConfig(
+                        protocol_version=LEGACY_VERSION,
+                        send_initialized=False,
+                    ),
+                    recorder,
+                )
+                with self.assertRaises(HttpExchangeError) as raised:
+                    session.establish(0.05 if hold_open else 0.5)
+                self.assertEqual(raised.exception.finding_code, expected_code)
+                self.assertTrue(raised.exception.exchange.messages)
+                self.assertFalse(raised.exception.exchange.body_complete)
+                self.assertFalse(transport.initialized)
+                self.assertIsNone(transport.session_id)
+
+    def test_ambiguous_or_encoded_response_headers_cannot_clean_pass(self) -> None:
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"protocolVersion": LEGACY_VERSION},
+            },
+            separators=(",", ":"),
+        ).encode()
+        cases = {
+            "duplicate-content-length": (
+                b"Content-Length: 999\r\n"
+                + f"Content-Length: {len(body)}\r\n".encode()
+            ),
+            "duplicate-content-type": (
+                b"Content-Type: text/plain\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n".encode()
+            ),
+            "unsupported-content-encoding": (
+                b"Content-Type: application/json\r\nContent-Encoding: gzip\r\n"
+                + f"Content-Length: {len(body)}\r\n".encode()
+            ),
+            "duplicate-session": (
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n".encode()
+                + b"Mcp-Session-Id: first-session\r\n"
+                b"Mcp-Session-Id: second-session\r\n"
+            ),
+            "unsupported-transfer-encoding": (
+                b"Content-Type: application/json\r\nTransfer-Encoding: weird\r\n"
+            ),
+        }
+        for name, headers in cases.items():
+            response = (
+                b"HTTP/1.1 200 OK\r\n"
+                + headers
+                + b"Connection: close\r\n\r\n"
+                + body
+            )
+            with self.subTest(name=name), running_raw_http_responses([response]) as url:
+                recorder = EventRecorder()
+                transport = self.make_transport(url, recorder)
+                session = McpSession(
+                    transport,
+                    SessionConfig(
+                        protocol_version=LEGACY_VERSION,
+                        send_initialized=False,
+                    ),
+                    recorder,
+                )
+                with self.assertRaises((HttpExchangeError, TransportError)):
+                    session.establish(0.5)
+                self.assertFalse(transport.initialized)
+                self.assertIsNone(transport.session_id)
+
+    def test_session_termination_rejects_invalid_response_framing(self) -> None:
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"protocolVersion": LEGACY_VERSION},
+            },
+            separators=(",", ":"),
+        ).encode()
+        initialized = (
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode()
+            + b"Mcp-Session-Id: termination-private\r\nConnection: close\r\n\r\n"
+            + body
+        )
+        malformed_delete = (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n"
+            b"Content-Encoding: gzip\r\nConnection: close\r\n\r\n"
+        )
+        with running_raw_http_responses([initialized, malformed_delete]) as url:
+            recorder = EventRecorder()
+            transport = self.make_transport(url, recorder)
+            transport.send_message(initialize_request(), 0.5)
+            self.assertEqual(transport.session_id, "termination-private")
+            with self.assertRaises(TransportError):
+                transport.terminate_session(0.5)
+        self.assertIsNone(transport.session_id)
+        self.assertFalse(
+            any(
+                event.get("classification") == "session_terminated"
+                for event in recorder.events
+            )
+        )
+        self.assertTrue(
+            any(
+                event.get("classification") == "session_termination_error"
+                for event in recorder.events
+            )
+        )
+
     def test_http_json_batch_is_profile_gated_and_items_are_correlatable(self) -> None:
         body = json.dumps(
             [
@@ -627,6 +981,61 @@ class HttpTransportTests(unittest.TestCase):
                 transport.rpc("ping", {}, 1)
             self.assertTrue(
                 any(event["classification"] == "invalid_batch" for event in recorder.events)
+            )
+
+    def test_header_layers_coalesce_case_insensitively_with_origin_precedence(self) -> None:
+        with running_http_fixture("http-json") as fixture:
+            recorder = EventRecorder()
+            transport = self.make_transport(
+                fixture.url,
+                recorder,
+                headers={
+                    "accept": "application/json",
+                    "content-type": "application/json; charset=utf-8",
+                    "mcp-protocol-version": "user-experiment",
+                    "mcp-session-id": "stale-user-session",
+                },
+            )
+            transport.initialized = True
+            transport.session_id = "fresh-server-session"
+            transport.send_message(make_request("ping", 1, {}), 1)
+
+        outbound = next(
+            event
+            for event in recorder.events
+            if event.get("direction") == "client_to_server"
+        )
+        normalized = [name.lower() for name in outbound["headers"]]
+        self.assertEqual(normalized.count("accept"), 1)
+        self.assertEqual(normalized.count("content-type"), 1)
+        self.assertEqual(normalized.count("mcp-protocol-version"), 1)
+        self.assertEqual(normalized.count("mcp-session-id"), 1)
+        self.assertEqual(
+            fixture.state.received_http[0]["headers"]["accept"],
+            "application/json",
+        )
+        self.assertEqual(
+            fixture.state.received_http[0]["headers"]["content-type"],
+            "application/json; charset=utf-8",
+        )
+        # As in the original probe, fresh generated protocol metadata remains
+        # authoritative after initialization even when the user used another
+        # spelling of the same field name.
+        self.assertEqual(
+            fixture.state.received_http[0]["headers"]["mcp-protocol-version"],
+            LEGACY_VERSION,
+        )
+        self.assertEqual(
+            fixture.state.received_http[0]["headers"]["mcp-session-id"],
+            "fresh-server-session",
+        )
+
+        direct = self.make_transport("http://127.0.0.1:1/mcp", EventRecorder())
+        with self.assertRaises(ConfigurationError):
+            direct.send_wire(
+                "{}",
+                0.1,
+                headers={"X-Trace": "one", "x-trace": "two"},
             )
 
     def test_sse_parser_enforces_event_issue_id_and_line_limits(self) -> None:

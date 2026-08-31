@@ -115,6 +115,15 @@ do not infer broad conformance from the overall status alone.
   retry after an expired-session `404`, including the recovery required by the
   `2025-11-25` specification; it exposes that exchange as a transport or
   compatibility failure.
+- Streamable HTTP SSE parsing is request-scoped. Probe does not open an
+  independent long-lived GET/listening stream and does not guarantee capture of
+  events that arrive after the correlated POST response. Full resumability is
+  outside the supported subset.
+- HTTP response bodies, including session termination responses, are decoded
+  only when Content-Encoding is absent or `identity`. Other encodings remain
+  opaque evidence and fail the exchange. Duplicate critical singleton headers,
+  Content-Length with Transfer-Encoding, unsupported transfer codings, and
+  incomplete declared bodies are rejected as ambiguous or incomplete framing.
 - The safe built-in suite does not inject method-specific invalid parameters,
   malformed request objects, duplicate initialization, or logging-level
   changes. Those require an explicit scenario so the exact input and expected
@@ -143,6 +152,6 @@ operational or configuration failure and cannot produce an overall clean pass.
 - Pagination: 100 pages by default, configurable through 1,000, with 100,000
   collected items and 64 MiB of cumulative decoded items per session.
 - Strict decoded JSON: maximum depth 100 and 100,000 nodes. A scenario file is
-  additionally limited to 1 MiB.
+  additionally limited to 1 MiB; CLI JSON arguments/files are limited to 8 MiB.
 - Transcript capture and loading: 10,000 events/physical lines and 64 MiB total;
   see [transcript storage and limits](TRANSCRIPTS.md#storage-and-limits).

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 
 EXIT_OK = 0
 EXIT_COMPATIBILITY_FAILURE = 1
@@ -22,6 +24,15 @@ class ConfigurationError(ProbeError):
 
 class TransportError(ProbeError):
     exit_code = EXIT_TRANSPORT_FAILURE
+
+
+class HttpExchangeError(TransportError):
+    """HTTP wire evidence exists, but no usable correlated response did."""
+
+    def __init__(self, message: str, exchange: Any, *, finding_code: str) -> None:
+        super().__init__(message)
+        self.exchange = exchange
+        self.finding_code = finding_code
 
 
 class ProbeTimeout(TransportError, TimeoutError):

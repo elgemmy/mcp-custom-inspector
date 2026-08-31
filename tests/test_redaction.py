@@ -30,6 +30,10 @@ class RedactionTests(unittest.TestCase):
             "accessToken",
             "refresh-token",
             "api_key",
+            "GoogleApiKey",
+            "openaiApiKey",
+            "OcpApimSubscriptionKey",
+            "AzureFunctionsKey",
             "client.secret",
             "private_key",
             "x-amz-signature",
@@ -60,6 +64,9 @@ class RedactionTests(unittest.TestCase):
             else:
                 self.assertEqual(headers[key], REDACTED, key)
         self.assertTrue(sensitive_header("MCP-PARAM-anything"))
+        self.assertTrue(sensitive_header("GoogleApiKey"))
+        self.assertTrue(sensitive_header("OcpApimSubscriptionKey"))
+        self.assertTrue(sensitive_header("X-Client-Key"))
 
     def test_nested_values_urls_and_sequences_are_redacted_without_mutation(self) -> None:
         original = {
@@ -170,6 +177,16 @@ class RedactionTests(unittest.TestCase):
         self.assertIn('"safe":"visible"', safe)
         self.assertIn(REDACTED, safe)
 
+    def test_raw_protocol_vocabulary_survives_secret_collision(self) -> None:
+        raw = '{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}'
+        self.assertEqual(redact_raw(raw, ("id", "ping")), raw)
+
+        duplicate = (
+            '{"jsonrpc":"2.0","method":"ping",'
+            '"token":"private","token":"safe"}'
+        )
+        self.assertEqual(redact_raw(duplicate), REDACTED)
+
     def test_raw_malformed_json_redacts_scalars_and_withholds_complex_secret_values(self) -> None:
         scalar = redact_raw('{"token":"malformed-secret", broken')
         self.assertNotIn("malformed-secret", scalar)
@@ -205,9 +222,19 @@ class RedactionTests(unittest.TestCase):
             {
                 "Authorization": f"Basic {basic}",
                 "Cookie": 'sid="cookie-secret"; csrf=csrf-secret',
+                "GoogleApiKey": "compact-header-secret",
+                "X-Client-Key": "client-key-secret",
             }
         )
-        for secret in (basic, "alice", "hunter2", "cookie-secret", "csrf-secret"):
+        for secret in (
+            basic,
+            "alice",
+            "hunter2",
+            "cookie-secret",
+            "csrf-secret",
+            "compact-header-secret",
+            "client-key-secret",
+        ):
             self.assertIn(secret, header_secrets)
 
         url_secrets = known_secrets_from_url(

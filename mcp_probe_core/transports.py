@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import os
 import queue
 import select
@@ -17,7 +18,13 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
-from .errors import ConfigurationError, ProbeTimeout, ProcessExited, TransportError
+from .errors import (
+    ConfigurationError,
+    HttpExchangeError,
+    ProbeTimeout,
+    ProcessExited,
+    TransportError,
+)
 from .protocol import (
     JsonObject,
     ProtocolProfile,
@@ -96,6 +103,42 @@ def validate_http_headers(headers: dict[str, str]) -> None:
             )
 
 
+def _merge_http_headers(*sources: dict[str, str]) -> dict[str, str]:
+    """Merge header layers with HTTP's case-insensitive field-name semantics.
+
+    Later layers retain the same precedence they had in the original probe,
+    while replacing an earlier spelling instead of accidentally putting two
+    differently-cased copies of one field on the wire.
+    """
+
+    merged: dict[str, str] = {}
+    spellings: dict[str, str] = {}
+    for source in sources:
+        for name, value in source.items():
+            if isinstance(name, str):
+                normalized = name.lower()
+                previous = spellings.get(normalized)
+                if previous is not None:
+                    del merged[previous]
+                spellings[normalized] = name
+            merged[name] = value
+    return merged
+
+
+def _setdefault_http_header(
+    headers: dict[str, str], name: str, value: str
+) -> None:
+    """Set a default only when no case-insensitive spelling already exists."""
+
+    normalized = name.lower()
+    if any(
+        isinstance(existing, str) and existing.lower() == normalized
+        for existing in headers
+    ):
+        return
+    headers[name] = value
+
+
 @dataclass
 class InboundMessage:
     payload: Any
@@ -125,6 +168,7 @@ class HttpExchange:
     messages: list[InboundMessage]
     parse_issues: list[str]
     timed_out: bool = False
+    body_complete: bool = True
 
 
 @dataclass
@@ -256,9 +300,11 @@ class _SseDecoder:
         return message
 
 
-def _rpc_key(value: Any) -> tuple[str, str | int] | None:
+def _rpc_key(value: Any) -> tuple[str, str | int | float] | None:
     if type(value) is int:
         return ("int", value)
+    if isinstance(value, float) and math.isfinite(value):
+        return ("float", value)
     if isinstance(value, str):
         return ("str", value)
     return None
@@ -298,6 +344,79 @@ def header_value(headers: dict[str, str], name: str) -> str | None:
     return None
 
 
+def _declared_content_length(
+    headers: dict[str, str], limit: int
+) -> tuple[int | None, list[str]]:
+    raw = header_value(headers, "Content-Length")
+    if raw is None:
+        return None, []
+    normalized = raw.strip()
+    if not normalized or any(character < "0" or character > "9" for character in normalized):
+        return None, [f"HTTP response has invalid Content-Length {raw!r}."]
+    length = int(normalized, 10)
+    if length > limit:
+        raise TransportError(
+            f"HTTP Content-Length {length} exceeds the {limit}-byte response limit."
+        )
+    return length, []
+
+
+def _response_header_snapshot(
+    headers: Any, limit: int
+) -> tuple[dict[str, str], list[str], list[tuple[str, str]], int | None]:
+    raw_items_method = getattr(headers, "raw_items", None)
+    raw_items = list(raw_items_method() if callable(raw_items_method) else headers.items())
+    snapshot = {str(name): str(value) for name, value in raw_items}
+    values: dict[str, list[str]] = {}
+    for name, value in raw_items:
+        values.setdefault(str(name).lower(), []).append(str(value))
+
+    issues: list[str] = []
+    for name in (
+        "content-length",
+        "content-encoding",
+        "content-type",
+        "mcp-session-id",
+    ):
+        if len(values.get(name, ())) > 1:
+            issues.append(
+                f"HTTP response contains duplicate {name} headers; "
+                "the singleton value is ambiguous."
+            )
+    if values.get("content-length") and values.get("transfer-encoding"):
+        issues.append(
+            "HTTP response contains both Content-Length and Transfer-Encoding; "
+            "body framing is ambiguous."
+        )
+    transfer_encodings = values.get("transfer-encoding", ())
+    if transfer_encodings and (
+        len(transfer_encodings) != 1
+        or transfer_encodings[0].strip().lower() != "chunked"
+    ):
+        issues.append(
+            "HTTP response uses an unsupported or ambiguous Transfer-Encoding."
+        )
+
+    over_limit: int | None = None
+    for raw in values.get("content-length", ()):
+        normalized = raw.strip()
+        if normalized and all("0" <= character <= "9" for character in normalized):
+            candidate = int(normalized, 10)
+            if candidate > limit:
+                over_limit = max(over_limit or 0, candidate)
+    return snapshot, issues, raw_items, over_limit
+
+
+def _safe_http_exception_detail(recorder: EventRecorder, exc: BaseException) -> str:
+    redacted = recorder.redact_text(str(exc))
+    escaped = redacted.encode("unicode_escape", errors="backslashreplace").decode(
+        "ascii"
+    )
+    if len(escaped) > 4096:
+        return escaped[:4096] + "...[truncated]"
+    return escaped
+
+
 class StdioTransport:
     """Newline-framed MCP over a managed subprocess."""
 
@@ -333,7 +452,7 @@ class StdioTransport:
         self._incoming: queue.Queue[InboundMessage] = queue.Queue(
             maxsize=MAX_BUFFERED_STDIO_MESSAGES
         )
-        self._pending: dict[tuple[str, str | int], list[InboundMessage]] = {}
+        self._pending: dict[tuple[str, str | int | float], list[InboundMessage]] = {}
         self._notifications: queue.Queue[InboundMessage] = queue.Queue(
             maxsize=MAX_BUFFERED_STDIO_MESSAGES
         )
@@ -349,8 +468,8 @@ class StdioTransport:
         self._closing = threading.Event()
         self._threads: list[threading.Thread] = []
         self._next_id = 1
-        self._used_ids: set[tuple[str, str | int]] = set()
-        self._outstanding: dict[tuple[str, str | int], str] = {}
+        self._used_ids: set[tuple[str, str | int | float]] = set()
+        self._outstanding: dict[tuple[str, str | int | float], str] = {}
         self._write_lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._buffer_lock = threading.Lock()
@@ -412,7 +531,10 @@ class StdioTransport:
         assert self._proc is not None and self._proc.stdout is not None
         stream = self._proc.stdout
         try:
-            while not self._closing.is_set():
+            # Keep draining until EOF even after close() has stopped new writes.
+            # A cooperative child may flush more than one pipe buffer while
+            # handling stdin EOF; abandoning the readers would deadlock its exit.
+            while True:
                 raw = stream.readline(self.max_message_bytes + 1)
                 if not raw:
                     break
@@ -601,7 +723,8 @@ class StdioTransport:
         assert self._proc is not None and self._proc.stderr is not None
         stream = self._proc.stderr
         try:
-            while not self._closing.is_set():
+            # See _read_stdout: stderr must remain drained through child exit.
+            while True:
                 raw = stream.readline(self.max_message_bytes + 1)
                 if not raw:
                     break
@@ -739,7 +862,8 @@ class StdioTransport:
         if not self._write_lock.acquire(timeout=max(0.0, remaining)):
             self._abort_timed_out_write(description, float(chosen_timeout))
         try:
-            if self._closing.is_set() or proc.poll() is not None:
+            returncode = proc.poll()
+            if self._closing.is_set() or returncode not in {None, 0}:
                 raise TransportError("stdio server is closing or has exited.")
             if os.name == "posix":
                 self._write_posix(
@@ -839,21 +963,33 @@ class StdioTransport:
                 self._release_buffer(message)
                 return message
             except queue.Empty:
-                if self._stdout_eof.is_set() and self._incoming.empty():
-                    returncode = self.returncode
+                # A descendant can inherit stdout after the direct server
+                # crashes, so EOF may be delayed arbitrarily.  Buffered
+                # messages win, but an exited direct child is immediately a
+                # process failure once the queue is empty.
+                returncode = self.returncode
+                if (
+                    self._incoming.empty()
+                    and (
+                        returncode not in {None, 0}
+                        or self._stdout_eof.is_set()
+                    )
+                ):
                     detail = f" (exit {returncode})" if returncode is not None else ""
                     raise ProcessExited(f"stdio server closed stdout{detail}.")
 
     def wait_for_response(
         self,
-        request_id: str | int,
+        request_id: str | int | float,
         timeout: float,
         *,
         cancel_on_timeout: bool = True,
     ) -> InboundMessage:
         wanted = _rpc_key(request_id)
         if wanted is None:
-            raise TransportError("Cannot correlate a response to a non-string/non-integer request ID.")
+            raise TransportError(
+                "Cannot correlate a response to a non-string/non-finite-number request ID."
+            )
         waiting = self._pending.get(wanted)
         if waiting:
             message = waiting.pop(0)
@@ -928,7 +1064,7 @@ class StdioTransport:
 
     def rpc(self, method: str, params: JsonObject | None, timeout: float) -> InboundMessage:
         request_id = self.next_id()
-        self.send_message(make_request(method, request_id, params))
+        self.send_message(make_request(method, request_id, params), timeout=timeout)
         return self.wait_for_response(request_id, timeout)
 
     def observed_server_requests(self) -> list[InboundMessage]:
@@ -1159,6 +1295,12 @@ class StdioTransport:
         descendant_terminated, descendant_killed = self._cleanup_descendant_group()
         terminated = terminated or descendant_terminated
         killed = killed or descendant_killed
+        # Once the process group is gone, let the pipe readers consume bytes
+        # already buffered by the kernel before closing their streams.  Closing
+        # first can truncate a cooperative child's final diagnostics.
+        for thread in self._threads:
+            if thread is not threading.current_thread():
+                thread.join(timeout=max(0.5, self.shutdown_timeout))
         for stream in (proc.stdout, proc.stderr):
             if stream is not None:
                 try:
@@ -1166,7 +1308,7 @@ class StdioTransport:
                 except OSError:
                     pass
         for thread in self._threads:
-            if thread is not threading.current_thread():
+            if thread is not threading.current_thread() and thread.is_alive():
                 thread.join(timeout=0.5)
         result = CleanupResult(proc.poll(), graceful, terminated, killed)
         self._record_cleanup_event(
@@ -1201,21 +1343,35 @@ class StdioTransport:
 
         if os.name != "posix" or self._proc is None:
             return False, False
-        try:
-            os.killpg(self._proc.pid, 0)
-        except (OSError, ProcessLookupError):
+        # Closing the inherited stdin pipe is the normal shutdown signal for a
+        # cooperative worker whose short-lived launcher already exited.  Give
+        # that process group the same bounded grace period as a direct child
+        # before classifying cleanup as forced and sending SIGTERM.
+        deadline = time.monotonic() + self.shutdown_timeout
+        while self._process_group_exists() and time.monotonic() < deadline:
+            time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+        if not self._process_group_exists():
             return False, False
         self._record_cleanup_event(classification="process_group_terminate")
         terminated = self._signal_process_group(signal.SIGTERM)
         if not terminated:
             return False, False
-        time.sleep(min(self.shutdown_timeout, 0.05))
-        try:
-            os.killpg(self._proc.pid, 0)
-        except (OSError, ProcessLookupError):
+        deadline = time.monotonic() + self.shutdown_timeout
+        while self._process_group_exists() and time.monotonic() < deadline:
+            time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+        if not self._process_group_exists():
             return True, False
         self._record_cleanup_event(classification="process_group_kill")
         return True, self._signal_process_group(signal.SIGKILL)
+
+    def _process_group_exists(self) -> bool:
+        if os.name != "posix" or self._proc is None:
+            return False
+        try:
+            os.killpg(self._proc.pid, 0)
+        except (OSError, ProcessLookupError):
+            return False
+        return True
 
     def _record_cleanup_event(self, *, classification: str, **metadata: Any) -> None:
         try:
@@ -1255,7 +1411,7 @@ class HttpTransport:
         self.initialized = False
         self.server_request_handler: Callable[[InboundMessage], JsonObject | None] | None = None
         self._next_id = 1
-        self._used_ids: set[tuple[str, str | int]] = set()
+        self._used_ids: set[tuple[str, str | int | float]] = set()
         self._session_lock = threading.RLock()
         self._termination_result: int | None = None
         # urllib follows redirects by default and carries caller-supplied headers
@@ -1343,22 +1499,31 @@ class HttpTransport:
             raise TransportError(
                 f"Outgoing HTTP message exceeded {self.max_body_bytes} bytes."
             )
-        headers = {
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-            **self.extra_headers,
-        }
+        headers = _merge_http_headers(
+            {
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+            },
+            self.extra_headers,
+        )
         method = message.get("method") if isinstance(message, dict) else None
         if self.profile.modern and isinstance(message, dict):
-            headers.update(modern_http_headers(message, self.protocol_version))
+            headers = _merge_http_headers(
+                headers, modern_http_headers(message, self.protocol_version)
+            )
         elif self.profile.protocol_header and (
             self.initialized or include_protocol_header_on_initialize
         ):
-            headers["MCP-Protocol-Version"] = self.protocol_version
+            headers = _merge_http_headers(
+                headers, {"MCP-Protocol-Version": self.protocol_version}
+            )
         if self.profile.http_sessions and self.session_id:
-            headers["MCP-Session-Id"] = self.session_id
+            headers = _merge_http_headers(
+                headers, {"MCP-Session-Id": self.session_id}
+            )
         if derived_headers:
-            headers.update(derived_headers)
+            validate_http_headers(derived_headers)
+            headers = _merge_http_headers(headers, derived_headers)
         outbound_items = message if isinstance(message, list) else [message]
         for item in outbound_items:
             if isinstance(item, dict) and "id" in item:
@@ -1371,14 +1536,26 @@ class HttpTransport:
             classification=_outbound_message_classification(message, self.profile),
             server_request_depth=_server_request_depth,
         )
-        if method == "initialize" and exchange.messages:
+        if (
+            method == "initialize"
+            and exchange.messages
+            and exchange.body_complete
+            and not exchange.timed_out
+        ):
             matching = _find_matching_response(exchange.messages, message.get("id"))
             if matching and isinstance(matching.payload, dict) and "result" in matching.payload:
                 session_id = header_value(exchange.headers, "MCP-Session-Id")
                 if self.profile.http_sessions and session_id:
-                    self.accept_session_id(
-                        session_id, source_evidence=matching.evidence
-                    )
+                    try:
+                        self.accept_session_id(
+                            session_id, source_evidence=matching.evidence
+                        )
+                    except TransportError as exc:
+                        raise HttpExchangeError(
+                            str(exc),
+                            exchange,
+                            finding_code="HTTP_SESSION_ID",
+                        ) from None
                 self.initialized = True
         return exchange
 
@@ -1390,6 +1567,8 @@ class HttpTransport:
         content_type: str = "application/json",
         headers: dict[str, str] | None = None,
     ) -> HttpExchange:
+        if headers is not None:
+            validate_http_headers(headers)
         raw = body.encode("utf-8") if isinstance(body, str) else body
         if len(raw) > self.max_body_bytes:
             self.recorder.record(
@@ -1419,18 +1598,26 @@ class HttpTransport:
                 raw_payload = None
             if classify_message(raw_payload) == "request":
                 expected_response_id = message_id(raw_payload)
-        request_headers = {
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": content_type,
-            **self.extra_headers,
-            **(headers or {}),
-        }
+        request_headers = _merge_http_headers(
+            {
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": content_type,
+            },
+            self.extra_headers,
+            headers or {},
+        )
         if self.profile.modern:
-            request_headers.setdefault("MCP-Protocol-Version", self.protocol_version)
+            _setdefault_http_header(
+                request_headers, "MCP-Protocol-Version", self.protocol_version
+            )
         elif self.profile.protocol_header and self.initialized:
-            request_headers.setdefault("MCP-Protocol-Version", self.protocol_version)
+            _setdefault_http_header(
+                request_headers, "MCP-Protocol-Version", self.protocol_version
+            )
         if self.profile.http_sessions and self.session_id:
-            request_headers["MCP-Session-Id"] = self.session_id
+            request_headers = _merge_http_headers(
+                request_headers, {"MCP-Session-Id": self.session_id}
+            )
         return self._send_body(
             raw,
             timeout,
@@ -1486,32 +1673,91 @@ class HttpTransport:
                 request, timeout=_remaining_http_timeout(deadline)
             ) as response:
                 status = int(response.status)
-                response_headers = {key: value for key, value in response.headers.items()}
-                self.recorder.register_secrets(
-                    known_secrets_from_headers(response_headers)
-                )
-                response_body, messages, issues, timed_out = self._consume_response(
+                (
+                    response_headers,
+                    header_framing_issues,
+                    raw_response_headers,
+                    declared_over_limit,
+                ) = _response_header_snapshot(response.headers, self.max_body_bytes)
+                for name, value in raw_response_headers:
+                    self.recorder.register_secrets(
+                        known_secrets_from_headers({name: value})
+                    )
+                if declared_over_limit is not None:
+                    self.recorder.record(
+                        "probe",
+                        "http",
+                        classification="resource_limit",
+                        status=status,
+                        headers=response_headers,
+                        error=(
+                            f"HTTP Content-Length {declared_over_limit} exceeds "
+                            f"the {self.max_body_bytes}-byte response limit."
+                        ),
+                    )
+                    raise TransportError(
+                        f"HTTP Content-Length {declared_over_limit} exceeds the "
+                        f"{self.max_body_bytes}-byte response limit."
+                    )
+                (
+                    response_body,
+                    messages,
+                    issues,
+                    timed_out,
+                    body_complete,
+                ) = self._consume_response(
                     response,
                     status,
                     response_headers,
                     deadline,
                     expected_response_id,
                     server_request_depth,
+                    header_framing_issues,
                 )
         except urllib.error.HTTPError as exc:
             status = int(exc.code)
-            response_headers = {key: value for key, value in exc.headers.items()}
-            self.recorder.register_secrets(
-                known_secrets_from_headers(response_headers)
-            )
+            (
+                response_headers,
+                header_framing_issues,
+                raw_response_headers,
+                declared_over_limit,
+            ) = _response_header_snapshot(exc.headers, self.max_body_bytes)
+            for name, value in raw_response_headers:
+                self.recorder.register_secrets(
+                    known_secrets_from_headers({name: value})
+                )
+            if declared_over_limit is not None:
+                self.recorder.record(
+                    "probe",
+                    "http",
+                    classification="resource_limit",
+                    status=status,
+                    headers=response_headers,
+                    error=(
+                        f"HTTP Content-Length {declared_over_limit} exceeds "
+                        f"the {self.max_body_bytes}-byte response limit."
+                    ),
+                )
+                exc.close()
+                raise TransportError(
+                    f"HTTP Content-Length {declared_over_limit} exceeds the "
+                    f"{self.max_body_bytes}-byte response limit."
+                )
             try:
-                response_body, messages, issues, timed_out = self._consume_response(
+                (
+                    response_body,
+                    messages,
+                    issues,
+                    timed_out,
+                    body_complete,
+                ) = self._consume_response(
                     exc,
                     status,
                     response_headers,
                     deadline,
                     expected_response_id,
                     server_request_depth,
+                    header_framing_issues,
                 )
             finally:
                 exc.close()
@@ -1540,26 +1786,28 @@ class HttpTransport:
                 raise ProbeTimeout(
                     f"HTTP request timed out for {redact_url(self.url)}."
                 ) from None
+            safe_error = _safe_http_exception_detail(self.recorder, exc)
             self.recorder.record(
                 "probe",
                 "http",
                 classification="transport_error",
                 url=self.url,
-                error=str(exc),
+                error=safe_error,
             )
             raise TransportError(
-                f"HTTP request failed for {redact_url(self.url)}: {redact_text(str(exc))}"
+                f"HTTP request failed for {redact_url(self.url)}: {safe_error}"
             ) from None
-        except (OSError, ValueError, http.client.InvalidURL) as exc:
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            safe_error = _safe_http_exception_detail(self.recorder, exc)
             self.recorder.record(
                 "probe",
                 "http",
                 classification="transport_error",
                 url=self.url,
-                error=str(exc),
+                error=safe_error,
             )
             raise TransportError(
-                f"HTTP request failed for {redact_url(self.url)}: {redact_text(str(exc))}"
+                f"HTTP request failed for {redact_url(self.url)}: {safe_error}"
             ) from None
         try:
             text = response_body.decode("utf-8", errors="strict")
@@ -1584,12 +1832,13 @@ class HttpTransport:
                     event_id,
                 )
                 messages.extend(recorded)
-                self._service_http_server_requests(
-                    recorded,
-                    deadline,
-                    server_request_depth,
-                    grouped=grouped,
-                )
+                if body_complete:
+                    self._service_http_server_requests(
+                        recorded,
+                        deadline,
+                        server_request_depth,
+                        grouped=grouped,
+                    )
         issues = decode_issues + issues
         self.recorder.record(
             "probe",
@@ -1600,6 +1849,7 @@ class HttpTransport:
             url=self.url,
             byteLength=len(response_body),
             timedOut=timed_out,
+            bodyComplete=body_complete,
         )
         unexpected_session_id = header_value(response_headers, "MCP-Session-Id")
         if unexpected_session_id and not self.profile.http_sessions:
@@ -1633,7 +1883,15 @@ class HttpTransport:
                 status=status,
                 error=issue,
             )
-        return HttpExchange(status, response_headers, text, messages, issues, timed_out)
+        return HttpExchange(
+            status,
+            response_headers,
+            text,
+            messages,
+            issues,
+            timed_out,
+            body_complete,
+        )
 
     def _consume_response(
         self,
@@ -1643,9 +1901,35 @@ class HttpTransport:
         deadline: float,
         expected_response_id: Any,
         server_request_depth: int,
-    ) -> tuple[bytes, list[InboundMessage], list[str], bool]:
+        header_framing_issues: list[str],
+    ) -> tuple[bytes, list[InboundMessage], list[str], bool, bool]:
         content_type = header_value(response_headers, "Content-Type") or ""
         media_type = content_type.partition(";")[0].strip().lower()
+        content_length, length_issues = _declared_content_length(
+            response_headers, self.max_body_bytes
+        )
+        framing_issues = list(dict.fromkeys(header_framing_issues + length_issues))
+        content_encoding = header_value(response_headers, "Content-Encoding")
+        if content_encoding is not None and content_encoding.strip().lower() not in {
+            "",
+            "identity",
+        }:
+            body, timed_out, read_incomplete = _read_http_body(
+                response, self.max_body_bytes, deadline
+            )
+            issues = list(framing_issues)
+            issues.append(
+                "Unsupported HTTP Content-Encoding; the response body was "
+                "retained as opaque evidence."
+            )
+            if content_length is not None and len(body) != content_length:
+                issues.append(
+                    "HTTP body ended before its declared Content-Length "
+                    f"({len(body)} of {content_length} bytes received)."
+                )
+            if read_incomplete:
+                issues.append("HTTP response body ended during framed decoding.")
+            return body, [], issues, timed_out, False
         if media_type == "text/event-stream":
             return self._read_sse_response(
                 response,
@@ -1654,11 +1938,24 @@ class HttpTransport:
                 deadline,
                 expected_response_id,
                 server_request_depth,
+                content_length,
+                framing_issues,
             )
-        body, timed_out = _read_http_body(
+        body, timed_out, read_incomplete = _read_http_body(
             response, self.max_body_bytes, deadline
         )
-        return body, [], [], timed_out
+        issues = list(framing_issues)
+        complete = not timed_out and not framing_issues
+        if content_length is not None and len(body) != content_length:
+            issues.append(
+                "HTTP body ended before its declared Content-Length "
+                f"({len(body)} of {content_length} bytes received)."
+            )
+            complete = False
+        if read_incomplete:
+            issues.append("HTTP response body ended during framed decoding.")
+            complete = False
+        return body, [], issues, timed_out, complete
 
     def _read_sse_response(
         self,
@@ -1668,15 +1965,19 @@ class HttpTransport:
         deadline: float,
         expected_response_id: Any,
         server_request_depth: int,
-    ) -> tuple[bytes, list[InboundMessage], list[str], bool]:
+        content_length: int | None,
+        framing_issues: list[str],
+    ) -> tuple[bytes, list[InboundMessage], list[str], bool, bool]:
         decoder = _SseDecoder(max_event_bytes=self.max_body_bytes)
         body = bytearray()
         pending = bytearray()
         previous_was_cr = False
         messages: list[InboundMessage] = []
-        issues: list[str] = []
+        issues: list[str] = list(framing_issues)
         timed_out = False
         matched = False
+        deferred_server_requests: list[tuple[list[InboundMessage], bool]] = []
+        defer_server_requests = content_length is not None or bool(framing_issues)
 
         def add_issues(values: Iterable[str]) -> None:
             incoming = list(values)
@@ -1707,12 +2008,15 @@ class HttpTransport:
                     event_id,
                 )
                 messages.extend(recorded)
-                self._service_http_server_requests(
-                    recorded,
-                    deadline,
-                    server_request_depth,
-                    grouped=grouped,
-                )
+                if defer_server_requests:
+                    deferred_server_requests.append((recorded, grouped))
+                else:
+                    self._service_http_server_requests(
+                        recorded,
+                        deadline,
+                        server_request_depth,
+                        grouped=grouped,
+                    )
                 if any(
                     inbound.classification == "response"
                     and _rpc_key(message_id(inbound.payload))
@@ -1722,7 +2026,9 @@ class HttpTransport:
                 ):
                     matched = True
 
-        while not matched:
+        while not matched or (
+            content_length is not None and len(body) < content_length
+        ):
             try:
                 chunk = _read_http_chunk(
                     response,
@@ -1748,16 +2054,22 @@ class HttpTransport:
                         event_id,
                     )
                     messages.extend(recorded)
-                    self._service_http_server_requests(
-                        recorded,
-                        deadline,
-                        server_request_depth,
-                        grouped=grouped,
-                    )
+                    if defer_server_requests:
+                        deferred_server_requests.append((recorded, grouped))
+                    else:
+                        self._service_http_server_requests(
+                            recorded,
+                            deadline,
+                            server_request_depth,
+                            grouped=grouped,
+                        )
                 break
+            # Drain the entire chunk already returned by urllib.  A matching
+            # response may be followed by notifications or malformed SSE
+            # events in the same wire read; dropping those bytes would hide
+            # compatibility evidence.  The outer loop still stops before a
+            # subsequent blocking read once the requested response matched.
             for byte in chunk:
-                if matched:
-                    break
                 body.append(byte)
                 if len(body) > self.max_body_bytes:
                     raise TransportError(
@@ -1781,7 +2093,22 @@ class HttpTransport:
                     raise TransportError(
                         f"SSE line exceeded the {MAX_SSE_FIELD_BYTES}-byte safety limit."
                     )
-        return bytes(body), messages, issues, timed_out
+        complete = not timed_out and not framing_issues
+        if content_length is not None and len(body) != content_length:
+            issues.append(
+                "HTTP SSE body ended before its declared Content-Length "
+                f"({len(body)} of {content_length} bytes received)."
+            )
+            complete = False
+        if complete:
+            for recorded, grouped in deferred_server_requests:
+                self._service_http_server_requests(
+                    recorded,
+                    deadline,
+                    server_request_depth,
+                    grouped=grouped,
+                )
+        return bytes(body), messages, issues, timed_out, complete
 
     def _record_http_payload(
         self,
@@ -2049,6 +2376,19 @@ class HttpTransport:
         exchange = self.send_message(
             message, timeout, derived_headers=derived_headers
         )
+        if exchange.timed_out or not exchange.body_complete:
+            reason = (
+                "timed out before the HTTP response body completed"
+                if exchange.timed_out
+                else "used incomplete or invalid HTTP body framing"
+            )
+            if exchange.timed_out:
+                raise ProbeTimeout(
+                    f"HTTP response {reason} for response id={request_id!r}."
+                )
+            raise TransportError(
+                f"HTTP response {reason} for response id={request_id!r}."
+            )
         response = _find_matching_response(exchange.messages, request_id)
         self._service_http_server_requests(
             exchange.messages,
@@ -2070,16 +2410,89 @@ class HttpTransport:
         with self._session_lock:
             return self._terminate_session_once(timeout)
 
+    def _consume_termination_response(
+        self, response: Any, status: int, deadline: float
+    ) -> dict[str, str]:
+        (
+            response_headers,
+            framing_issues,
+            raw_response_headers,
+            declared_over_limit,
+        ) = _response_header_snapshot(response.headers, self.max_body_bytes)
+        for name, value in raw_response_headers:
+            self.recorder.register_secrets(
+                known_secrets_from_headers({name: value})
+            )
+        if declared_over_limit is not None:
+            raise TransportError(
+                f"HTTP Content-Length {declared_over_limit} exceeds the "
+                f"{self.max_body_bytes}-byte response limit."
+            )
+        content_length, length_issues = _declared_content_length(
+            response_headers, self.max_body_bytes
+        )
+        issues = list(dict.fromkeys(framing_issues + length_issues))
+        content_encoding = header_value(response_headers, "Content-Encoding")
+        if content_encoding is not None and content_encoding.strip().lower() not in {
+            "",
+            "identity",
+        }:
+            issues.append(
+                "Unsupported HTTP Content-Encoding on the session termination response."
+            )
+        body, timed_out, read_incomplete = _read_http_body(
+            response, self.max_body_bytes, deadline
+        )
+        if content_length is not None and len(body) != content_length:
+            issues.append(
+                "HTTP session termination body ended before its declared "
+                f"Content-Length ({len(body)} of {content_length} bytes received)."
+            )
+        if read_incomplete:
+            issues.append("HTTP session termination body ended during framed decoding.")
+        body_complete = not timed_out and not issues
+        self.recorder.record(
+            "probe",
+            "http",
+            classification="http_response",
+            status=status,
+            headers=response_headers,
+            url=self.url,
+            byteLength=len(body),
+            timedOut=timed_out,
+            bodyComplete=body_complete,
+            operation="session_terminate",
+        )
+        for issue in issues:
+            self.recorder.record(
+                "probe",
+                "http",
+                classification="parse_issue",
+                status=status,
+                error=issue,
+                operation="session_terminate",
+            )
+        if timed_out:
+            raise ProbeTimeout("HTTP session termination response timed out.")
+        if issues:
+            raise TransportError(
+                "HTTP session termination response used incomplete, ambiguous, "
+                "or unsupported framing."
+            )
+        return response_headers
+
     def _terminate_session_once(self, timeout: float) -> int | None:
         if not self.profile.http_sessions or not self.session_id:
             return self._termination_result
-        headers = {
-            "Accept": "application/json, text/event-stream",
-            **self.extra_headers,
-            "MCP-Session-Id": self.session_id,
-        }
+        headers = _merge_http_headers(
+            {"Accept": "application/json, text/event-stream"},
+            self.extra_headers,
+            {"MCP-Session-Id": self.session_id},
+        )
         if self.profile.protocol_header:
-            headers["MCP-Protocol-Version"] = self.protocol_version
+            headers = _merge_http_headers(
+                headers, {"MCP-Protocol-Version": self.protocol_version}
+            )
         validate_http_headers(headers)
         self.recorder.record(
             "client_to_server",
@@ -2095,43 +2508,45 @@ class HttpTransport:
                 request, timeout=_remaining_http_timeout(deadline)
             ) as response:
                 status = int(response.status)
-                response_headers = {key: value for key, value in response.headers.items()}
-                self.recorder.register_secrets(
-                    known_secrets_from_headers(response_headers)
+                response_headers = self._consume_termination_response(
+                    response, status, deadline
                 )
-                body, timed_out = _read_http_body(
-                    response, self.max_body_bytes, deadline
-                )
-                if timed_out:
-                    raise ProbeTimeout("HTTP session termination timed out.")
-                if len(body) > self.max_body_bytes:
-                    raise TransportError(
-                        f"HTTP response body exceeded {self.max_body_bytes} bytes."
-                    )
         except urllib.error.HTTPError as exc:
             status = int(exc.code)
-            response_headers = {key: value for key, value in exc.headers.items()}
-            self.recorder.register_secrets(
-                known_secrets_from_headers(response_headers)
+            try:
+                response_headers = self._consume_termination_response(
+                    exc, status, deadline
+                )
+            finally:
+                exc.close()
+        except TransportError as exc:
+            safe_error = _safe_http_exception_detail(self.recorder, exc)
+            self.recorder.record(
+                "probe",
+                "http",
+                classification="session_termination_error",
+                error=safe_error,
+                url=self.url,
             )
-            exc.close()
+            raise
         except (
             urllib.error.URLError,
             socket.timeout,
             TimeoutError,
             OSError,
             ValueError,
-            http.client.InvalidURL,
+            http.client.HTTPException,
         ) as exc:
+            safe_error = _safe_http_exception_detail(self.recorder, exc)
             self.recorder.record(
                 "probe",
                 "http",
                 classification="session_termination_error",
-                error=str(exc),
+                error=safe_error,
                 url=self.url,
             )
             raise TransportError(
-                f"Could not terminate HTTP session: {redact_text(str(exc))}"
+                f"Could not terminate HTTP session: {safe_error}"
             ) from None
         finally:
             self.session_id = None
@@ -2221,10 +2636,11 @@ def _read_http_chunk(response: Any, size: int, deadline: float) -> bytes:
 
 def _read_http_body(
     response: Any, limit: int, deadline: float
-) -> tuple[bytes, bool]:
+) -> tuple[bytes, bool, bool]:
     chunks: list[bytes] = []
     total = 0
     timed_out = False
+    incomplete = False
     while True:
         try:
             chunk = _read_http_chunk(
@@ -2233,13 +2649,18 @@ def _read_http_body(
         except (socket.timeout, TimeoutError):
             timed_out = True
             break
+        except http.client.IncompleteRead as exc:
+            chunk = exc.partial
+            incomplete = True
         if not chunk:
             break
         chunks.append(chunk)
         total += len(chunk)
         if total > limit:
             raise TransportError(f"HTTP response body exceeded {limit} bytes.")
-    return b"".join(chunks), timed_out
+        if incomplete:
+            break
+    return b"".join(chunks), timed_out, incomplete
 
 
 def parse_http_messages(

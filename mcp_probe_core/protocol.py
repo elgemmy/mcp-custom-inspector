@@ -80,7 +80,9 @@ def profile_for(version: str) -> ProtocolProfile:
         ) from exc
 
 
-def make_request(method: str, request_id: str | int, params: JsonObject | None = None) -> JsonObject:
+def make_request(
+    method: str, request_id: str | int | float, params: JsonObject | None = None
+) -> JsonObject:
     message: JsonObject = {"jsonrpc": "2.0", "id": request_id, "method": method}
     if params is not None:
         message["params"] = params
@@ -96,7 +98,7 @@ def make_notification(method: str, params: JsonObject | None = None) -> JsonObje
 
 def make_initialize_request(
     version: str,
-    request_id: str | int,
+    request_id: str | int | float,
     client_info: JsonObject,
     client_capabilities: JsonObject,
 ) -> JsonObject:
@@ -130,11 +132,15 @@ def classify_message(value: Any) -> str:
     return "invalid"
 
 
-def message_id(value: Any) -> str | int | None:
+def message_id(value: Any) -> str | int | float | None:
     if not isinstance(value, dict):
         return None
     candidate = value.get("id")
-    return candidate if isinstance(candidate, (str, int)) and not isinstance(candidate, bool) else None
+    if isinstance(candidate, str) or type(candidate) is int:
+        return candidate
+    if isinstance(candidate, float) and math.isfinite(candidate):
+        return candidate
+    return None
 
 
 def message_method(value: Any) -> str | None:
