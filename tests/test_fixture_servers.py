@@ -57,7 +57,8 @@ def post_json(
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as exc:
-        return exc.code, dict(exc.headers), exc.read()
+        with exc:
+            return exc.code, dict(exc.headers), exc.read()
 
 
 class StdioFixtureTests(unittest.TestCase):
