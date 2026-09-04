@@ -35,6 +35,13 @@ Run all repository-local verification without network access:
 python3 scripts/verify.py
 ```
 
+GitHub Actions runs the same gate on Linux with Python 3.11–3.14 for pull
+requests and pushes to `main` or `feat/compatibility-lab`. The gate installs no
+Python dependencies, uses subprocess and loopback HTTP fixtures, and needs no
+external MCP servers or credentials. CI enables `ResourceWarning` errors to
+surface cleanup regressions. Runner and Python setup still require network
+access; the verification commands themselves are repository-local.
+
 ## Ordinary inspection
 
 The original low-level inspection commands remain available. Launch a stdio
