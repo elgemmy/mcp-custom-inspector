@@ -8,11 +8,35 @@ line before a caller gets a chance to enforce a limit.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import contextmanager
+import os
 from pathlib import Path
+import stat
+from typing import BinaryIO
 
 
 class InputLimitError(ValueError):
     """An input exceeded a deterministic local resource limit."""
+
+
+@contextmanager
+def _open_regular_input(source: Path) -> Iterator[BinaryIO]:
+    # Reject devices before opening them, and FIFOs before waiting for a writer.
+    # Check the opened descriptor too: the path may change after stat().
+    if not stat.S_ISREG(source.stat().st_mode):
+        raise InputLimitError("Input must be a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(source, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise InputLimitError("Input must be a regular file")
+        stream = os.fdopen(descriptor, "rb")
+        descriptor = None
+        with stream:
+            yield stream
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def read_utf8_limited(
@@ -24,7 +48,7 @@ def read_utf8_limited(
     """Read one UTF-8 file without ever buffering more than ``max_bytes + 1``."""
 
     source = Path(path)
-    with source.open("rb") as stream:
+    with _open_regular_input(source) as stream:
         data = stream.read(max_bytes + 1)
     if len(data) > max_bytes:
         raise InputLimitError(f"{label} exceeds the {max_bytes}-byte safety limit")
@@ -44,7 +68,7 @@ def iter_utf8_lines_limited(
     source = Path(path)
     total = 0
     line_number = 0
-    with source.open("rb") as stream:
+    with _open_regular_input(source) as stream:
         while True:
             raw = stream.readline(max_line_bytes + 1)
             if not raw:
