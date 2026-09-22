@@ -607,6 +607,92 @@ def run_http(args: argparse.Namespace) -> int:
     return 0
 
 
+def load_path(args: argparse.Namespace) -> tuple[Json, list[tuple[int, Json, Any]], list[str]]:
+    path = load_json_file(args.path, "path")
+    def require(condition: bool, reason: str) -> None:
+        if not condition:
+            raise SystemExit(f"Invalid path: {reason}")
+
+    require(isinstance(path, dict), "expected an object")
+    require(not set(path) - {"name", "description", "server", "handshake", "timeout", "steps"}, "unknown field")
+    name = path.get("name")
+    require(isinstance(name, str) and bool(name) and name not in {".", ".."}
+            and "/" not in name and "\\" not in name, "name must be a nonempty filename")
+    require("description" not in path or isinstance(path["description"], str), "description must be text")
+    server = path.get("server", {})
+    require(isinstance(server, dict), "server must be an object")
+    server = dict(server)
+    require(not set(server) - {"stdio", "http", "env", "headers"}, "unknown server field")
+    require(not (args.server_cmd is not None and args.url is not None), "choose --server-cmd or --url")
+    if args.server_cmd is not None:
+        server.pop("http", None)
+        server["stdio"] = args.server_cmd
+    if args.url is not None:
+        server.pop("stdio", None)
+        server["http"] = args.url
+    require(("stdio" in server) != ("http" in server), "choose exactly one stdio or http target")
+    if "stdio" in server:
+        command = server["stdio"]
+        require(isinstance(command, list) and bool(command)
+                and all(isinstance(part, str) and part for part in command), "stdio must be a nonempty argv list")
+    else:
+        url = server["http"]
+        require(isinstance(url, str) and url.startswith(("http://", "https://")), "http must be an HTTP URL")
+    secrets = []
+    for key, overrides in (("env", parse_key_value(args.env, "--env")), ("headers", parse_header(args.header))):
+        values = server.get(key, {})
+        require(isinstance(values, dict) and all(isinstance(v, str) for v in values.values()), f"{key} must map names to strings")
+        for mapping in (values, overrides):
+            secrets.extend(v for k, v in mapping.items() if key == "env" or mask_secrets({k: v}, [])[k] == "***")
+        if key == "headers":
+            values = {k: v for k, v in values.items() if k.lower() not in {h.lower() for h in overrides}}
+        if values or overrides:
+            server[key] = {**values, **overrides}
+    path["server"] = server
+    timeout = args.timeout if args.timeout is not None else path.get("timeout", 15)
+    require(type(timeout) in (int, float) and 0 < timeout < float("inf"), "timeout must be positive and finite")
+    path["timeout"] = timeout
+    handshake = path.get("handshake", "auto")
+    require(handshake is False or handshake == "auto" or isinstance(handshake, dict), "invalid handshake")
+    steps = path.get("steps")
+    require(isinstance(steps, list), "steps must be a list")
+    for n, step in enumerate(steps, 1):
+        require(isinstance(step, dict), f"step {n} must be an object")
+        raw = "send" in step
+        allowed = {"send"} if raw else {"method", "params", "notify"}
+        require(not set(step) - allowed - {"expect", "wait", "label"}, f"unknown field in step {n}")
+        if not raw:
+            require(isinstance(step.get("method"), str) and bool(step["method"]), f"step {n} needs a method")
+            require(isinstance(step.get("params", {}), dict), f"step {n} params must be an object")
+        for key in ("wait", "notify"):
+            require(key not in step or type(step[key]) is bool, f"step {n} {key} must be boolean")
+        require("expect" not in step or step["expect"] in ("result", "error", "none", "timeout"), f"step {n} has invalid expect")
+        require("label" not in step or isinstance(step["label"], str), f"step {n} label must be text")
+    used_ids = [id_of(s["send"]) for s in steps if "send" in s]
+    next_id = 1
+    expanded = []
+    for n, step in enumerate(steps, 1):
+        if "send" in step:
+            message = step["send"]
+        else:
+            while next_id in used_ids:
+                next_id += 1
+            message = request(step["method"], next_id, step.get("params", {}))
+            next_id += 1
+            if step.get("notify"):
+                message.pop("id")
+        expanded.append((n, step, message))
+    if isinstance(handshake, dict) or (handshake == "auto" and not any(method_of(m) == "initialize" for _, _, m in expanded)):
+        while next_id in used_ids:
+            next_id += 1
+        params = handshake if isinstance(handshake, dict) else {
+            "protocolVersion": LATEST_PROTOCOL_VERSION, "capabilities": {},
+            "clientInfo": {"name": "mcp-probe", "version": "0.2.0"},
+        }
+        expanded[0:0] = [(0, {}, request("initialize", next_id, params)), (0, {}, initialized_notification())]
+    return path, expanded, secrets
+
+
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--protocol-version", default=LATEST_PROTOCOL_VERSION)
     parser.add_argument("--client-name", default="mcp-probe")
