@@ -77,6 +77,8 @@ report the number you saw, never one inferred from the summary.
 Use the actual `transcript` paths from the summaries. Place run flags before
 `--server-cmd --`; everything after it belongs to the server.
 `--url`, repeated `--env K=V`, and repeated `--header 'N: V'` override the target.
+When you start an HTTP server yourself, keep its PID and stop its whole process tree (`npx` spawns a child `node`);
+never `pkill -f` a pattern that could also match your own session.
 `--out DIR` changes the transcript directory; `--quiet` suppresses step lines.
 Stdout is a single JSON summary; progress goes to stderr.
 
@@ -90,6 +92,9 @@ python3 mcp_probe.py run paths/handshake-missing-protocol-version.json --env NOT
 
 Check `ok`, then each step's `outcome` and `error.code`.
 Outcomes are `result`, `error`, `timeout`, `closed`, and `sent`.
+A `recv` line without an `id` during a step is a server notification, not a reply; `unsolicited` counts them.
+If every step times out and the transcript has no `recv` lines at all, the server never started
+(missing package, no network, bad command): read its `stderr` events before concluding it ignores requests.
 HTTP also supplies `http_status`; a bodyless HTTP error need not be a JSON-RPC error.
 `result_keys` lists top-level result keys; the full result is in the transcript.
 Open only the transcript events needed for the relevant step and quote those lines

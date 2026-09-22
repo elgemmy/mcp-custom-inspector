@@ -12,3 +12,6 @@ runs/*
 # Local env/secrets used by MCP servers.
 .env
 *.env
+
+# Local scratch paths and agent test runs. Never shipped.
+scratch/

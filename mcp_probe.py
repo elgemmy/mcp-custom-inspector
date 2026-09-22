@@ -830,7 +830,7 @@ def run_path(args: argparse.Namespace) -> int:
                         print(mask_secrets(f"{n}: {outcome}" + (" (unexpected)" if not ok else ""), secrets), file=sys.stderr)
                 if code == 3 or (n == 0 and wait and outcome != "result"):
                     code = 3
-                    summary["error"] = failure or "Automatic handshake failed"
+                    summary["error"] = failure or f"Automatic handshake failed: {outcome}"
                     break
                 if not ok:
                     code = 2
