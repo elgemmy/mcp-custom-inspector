@@ -818,6 +818,67 @@ def run_path(args: argparse.Namespace) -> int:
     return code
 
 
+def read_run(filename: str) -> Json:
+    summary = None
+    try:
+        with Path(filename).open(encoding="utf-8") as source:
+            for line in source:
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise ValueError("expected transcript objects")
+                if "summary" in record:
+                    summary = record["summary"]
+        if not isinstance(summary, dict) or not isinstance(summary.get("steps"), list):
+            raise ValueError("missing summary footer")
+        seen = set()
+        for step in summary["steps"]:
+            if not isinstance(step, dict) or type(step.get("n")) is not int or step["n"] < 1 or step["n"] in seen:
+                raise ValueError("invalid or duplicate step number")
+            if step.get("outcome") not in ("result", "error", "timeout", "closed", "sent"):
+                raise ValueError("missing or invalid step outcome")
+            seen.add(step["n"])
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"Cannot read transcript {filename!r}: {exc}") from exc
+    return summary
+
+
+def diff_runs(args: argparse.Namespace) -> int:
+    a, b = read_run(args.a), read_run(args.b)
+    left = {step["n"]: step for step in a["steps"]}
+    right = {step["n"]: step for step in b["steps"]}
+    differences = []
+    for n in sorted(left.keys() | right.keys()):
+        if n not in left or n not in right:
+            differences.append(dict(step=n, field="only-in-A" if n in left else "only-in-B", a=left.get(n), b=right.get(n)))
+            continue
+        for field in ("outcome", "http_status", "error.code", "error.message", "result_keys"):
+            values = []
+            for row in (left[n], right[n]):
+                value = row
+                for key in field.split("."):
+                    value = value.get(key) if isinstance(value, dict) else None
+                values.append(value)
+            if values[0] != values[1]:
+                differences.append(dict(step=n, field=field, a=values[0], b=values[1]))
+    if a.get("server_exit_code") != b.get("server_exit_code"):
+        differences.append(dict(step=None, field="server_exit_code", a=a.get("server_exit_code"), b=b.get("server_exit_code")))
+    if args.json:
+        print(compact_json(differences))
+    else:
+        print(f"A: {a.get('name')}\nB: {b.get('name')}")
+        groups: dict[Any, list[str]] = {}
+        for difference in differences:
+            groups.setdefault(difference["step"], []).append(
+                f"{difference['field']}: {compact_json(difference['a'])} -> {compact_json(difference['b'])}")
+        if groups:
+            print("step | differences")
+            for n, changes in groups.items():
+                print(f"{n if n is not None else 'run'} | {'; '.join(changes)}")
+        count = len(groups)
+        print("identical" if not count else f"{count} difference{'s' if count != 1 else ''}")
+    return 2 if differences else 0
+
+
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--protocol-version", default=LATEST_PROTOCOL_VERSION)
     parser.add_argument("--client-name", default="mcp-probe")
@@ -874,6 +935,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--timeout", type=float)
     run.add_argument("--quiet", action="store_true")
     run.set_defaults(func=run_path)
+
+    diff = sub.add_parser("diff", help="Compare step outcomes in two transcripts.")
+    diff.add_argument("a")
+    diff.add_argument("b")
+    diff.add_argument("--json", action="store_true")
+    diff.set_defaults(func=diff_runs)
 
     return parser
 
