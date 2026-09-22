@@ -22,6 +22,7 @@ import argparse
 from collections import deque
 import datetime as dt
 import json
+import http.client
 import os
 import queue
 import signal
@@ -41,6 +42,7 @@ LATEST_PROTOCOL_VERSION = "2025-06-18"
 
 
 Json = dict[str, Any]
+NO_RESPONSE = object()
 
 
 def now_iso() -> str:
@@ -131,6 +133,7 @@ class Logger:
         self.sink = sink
         self.secrets = secrets or []
         self.step: int | None = None
+        self.received: list[Any] = []
         self._lock = threading.Lock()
 
     def event(self, direction: str, transport: str, payload: Any, **meta: Any) -> None:
@@ -145,6 +148,10 @@ class Logger:
             **{k: v for k, v in meta.items() if v is not None},
         }
         if self.sink is not None:
+            if self.sink.closed:
+                return
+            if direction == "recv" and (transport != "http" or payload != ""):
+                self.received.append(payload)
             record = mask_secrets(record, self.secrets)
             payload = record["payload"]
         prefix = f"[{record['ts']}] {direction.upper()} {transport}"
@@ -241,8 +248,10 @@ class StdioMcpProbe:
             bufsize=1,
             env=full_env,
         )
-        threading.Thread(target=self._read_stdout, daemon=True).start()
-        threading.Thread(target=self._read_stderr, daemon=True).start()
+        self._readers = [threading.Thread(target=reader, daemon=True)
+                         for reader in (self._read_stdout, self._read_stderr)]
+        for reader in self._readers:
+            reader.start()
 
     def close(self) -> None:
         self._closed.set()
@@ -284,6 +293,12 @@ class StdioMcpProbe:
                 self.logger.event("recv-invalid", "stdio", line, error=str(exc))
                 continue
             self.logger.event("recv", "stdio", message)
+            if self.logger.sink and isinstance(message, dict) and "method" in message and "id" in message:
+                try:
+                    self._handle_server_message(message)
+                except OSError:
+                    break
+                continue
             self._messages.put(message)
         self._closed.set()
 
@@ -359,6 +374,9 @@ class StdioMcpProbe:
                     "message": f"Probe does not implement client method: {method}",
                 },
             }
+        if self.logger.sink:
+            self.logger.event("server-request", "stdio", message)
+            self.logger.event("auto-response", "stdio", response_msg)
         self.send(response_msg)
 
     def rpc(self, method: str, params: Json | None, timeout: float) -> Json:
@@ -416,7 +434,7 @@ class HttpMcpProbe:
         if "Mcp-Session-Id" in resp_headers:
             self.session_id = resp_headers["Mcp-Session-Id"]
 
-        messages = parse_http_body(raw_body, resp_headers.get("Content-Type", ""))
+        messages = parse_http_body(raw_body, next((v for k, v in resp_headers.items() if k.lower() == "content-type"), "") if self.logger.sink else resp_headers.get("Content-Type", ""))
         for msg in messages:
             self.logger.event("recv", "http", msg, status=status, headers=resp_headers)
         if not messages:
@@ -693,6 +711,113 @@ def load_path(args: argparse.Namespace) -> tuple[Json, list[tuple[int, Json, Any
     return path, expanded, secrets
 
 
+def path_exchange(probe: Any, message: Any, wait: bool, timeout: float) -> tuple[Any, int | None]:
+    http = isinstance(probe, HttpMcpProbe)
+    response = probe.send(message, timeout) if http else probe.send(message)
+    status = response.status if http else None
+    pending = list(response.messages) if http else []
+    if http:
+        probe.session_id = next((v for k, v in response.headers.items() if k.lower() == "mcp-session-id"), probe.session_id)
+    found = NO_RESPONSE
+    deadline = time.monotonic() + timeout
+    while wait or pending:
+        if http:
+            if not pending:
+                return found, status
+            incoming = pending.pop(0)
+        else:
+            if probe._closed.is_set() and probe._messages.empty():
+                raise ConnectionError("Server closed before answering")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return NO_RESPONSE, status
+            try:
+                incoming = probe._messages.get(timeout=min(remaining, 0.1))
+            except queue.Empty:
+                continue
+        if isinstance(incoming, dict) and "method" in incoming and "id" in incoming:
+            reply = {"jsonrpc": "2.0", "id": incoming["id"]}
+            method = incoming["method"]
+            reply.update({"result": {} if method == "ping" else {"roots": []}} if method in ("ping", "roots/list")
+                         else {"error": {"code": -32601, "message": f"Probe does not implement client method: {method}"}})
+            probe.logger.event("server-request", "http", incoming)
+            probe.logger.event("auto-response", "http", reply)
+            pending.extend(probe.send(reply, timeout).messages)
+        elif wait and (not isinstance(message, dict) or "id" not in message or (isinstance(incoming, dict) and "id" in incoming and ("result" in incoming or "error" in incoming) and id_of(incoming) == message["id"])):
+            if not http:
+                return incoming, status
+            found = incoming
+    return NO_RESPONSE, status
+
+
+def run_path(args: argparse.Namespace) -> int:
+    path, steps, secrets = load_path(args)
+    server, timeout = path["server"], path["timeout"]
+    transport = "stdio" if "stdio" in server else "http"
+    started, clock = now_iso(), time.monotonic()
+    destination = Path(args.out) / f"{path['name']}-{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%S%fZ}.jsonl"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    summary = dict(name=path["name"], transport=transport, server=server, started=started,
+                   transcript=str(destination), steps=[], server_requests=[], unsolicited=0, server_exit_code=None, ok=True)
+    code, matched = 0, []
+    with destination.open("x", encoding="utf-8") as sink:
+        logger = Logger(False, sink, secrets)
+        probe = StdioMcpProbe(server["stdio"], server.get("env", {}), logger) if transport == "stdio" else HttpMcpProbe(server["http"], server.get("headers", {}), logger)
+        try:
+            if transport == "stdio":
+                probe.start()
+            for n, step, message in steps:
+                logger.step = n
+                tick = time.monotonic()
+                wait = step.get("wait", isinstance(message, dict) and "id" in message)
+                result, status, failure = None, None, None
+                try:
+                    result, status = path_exchange(probe, message, wait, timeout)
+                    outcome = "sent" if not wait else "timeout"
+                    if wait and result is not NO_RESPONSE:
+                        matched.append(result)
+                        outcome = "error" if isinstance(result, dict) and "error" in result else "result" if isinstance(result, dict) and "result" in result else "sent"
+                    if method_of(message) == "initialize" and transport == "http":
+                        probe.protocol_version = negotiated_protocol_version(result, LATEST_PROTOCOL_VERSION)
+                except TimeoutError:
+                    outcome = "timeout"
+                except (OSError, ValueError, http.client.HTTPException) as exc:
+                    outcome, failure, code = "closed", str(exc), 3
+                expected = step.get("expect")
+                ok = expected is None or outcome == ("timeout" if expected == "none" else expected)
+                row = dict(n=n, label=step.get("label"), method=method_of(message), id=id_of(message),
+                           outcome=outcome, error={k: result["error"].get(k) for k in ("code", "message")} if isinstance(result, dict) and isinstance(result.get("error"), dict) else None,
+                           result_keys=sorted(result["result"]) if isinstance(result, dict) and isinstance(result.get("result"), dict) else None,
+                           elapsed_ms=round((time.monotonic() - tick) * 1000), expect=expected, ok=ok)
+                if status is not None:
+                    row["http_status"] = status
+                if failure:
+                    row.update(transport_error=failure, stderr_tail=list(getattr(probe, "_stderr_tail", [])))
+                if n:
+                    summary["steps"].append(row)
+                    if not args.quiet:
+                        print(mask_secrets(f"{n}: {outcome}" + (" (unexpected)" if not ok else ""), secrets), file=sys.stderr)
+                if code == 3 or (n == 0 and wait and outcome != "result"):
+                    code = 3
+                    summary["error"] = failure or "Automatic handshake failed"
+                    break
+                if not ok:
+                    code = 2
+        except OSError as exc:
+            code, summary["error"] = 1, str(exc)
+        finally:
+            if transport == "stdio":
+                probe.close()
+                for reader in getattr(probe, "_readers", []):
+                    reader.join(timeout=1)
+                summary["server_exit_code"] = probe._proc.poll() if probe._proc else None
+        summary["server_requests"] = [m for m in logger.received if isinstance(m, dict) and "method" in m and "id" in m]
+        summary["unsolicited"] = sum(not any(m is reply for reply in matched) and m not in summary["server_requests"] for m in logger.received)
+        summary.update(elapsed_ms=round((time.monotonic() - clock) * 1000), ok=code == 0)
+        print(compact_json(logger.summary(summary)))
+    return code
+
+
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--protocol-version", default=LATEST_PROTOCOL_VERSION)
     parser.add_argument("--client-name", default="mcp-probe")
@@ -739,12 +864,33 @@ def build_parser() -> argparse.ArgumentParser:
 
     http.set_defaults(func=run_http)
 
+    run = sub.add_parser("run", help="Execute a path and record a transcript.")
+    run.add_argument("path")
+    run.add_argument("--out", default="runs")
+    run.add_argument("--server-cmd", nargs=argparse.REMAINDER)
+    run.add_argument("--url")
+    run.add_argument("--env", action="append")
+    run.add_argument("--header", action="append")
+    run.add_argument("--timeout", type=float)
+    run.add_argument("--quiet", action="store_true")
+    run.set_defaults(func=run_path)
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["run"] and "--server-cmd" in argv:
+        boundary = argv.index("--server-cmd") + 1
+        if argv[boundary:boundary + 1] == ["--"]:
+            del argv[boundary]
     parser = build_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        if argv[:1] in (["run"], ["diff"]) and exc.code == 2:
+            return 1
+        raise
     try:
         return int(args.func(args) or 0)
     except SystemExit:
