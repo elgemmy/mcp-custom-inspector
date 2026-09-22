@@ -25,6 +25,7 @@ import json
 import http.client
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -113,16 +114,31 @@ def parse_header(values: list[str] | None) -> dict[str, str]:
     return parsed
 
 
+MIN_MASKED_SECRET_LENGTH = 8
+
+
 def mask_secrets(value: Any, secrets: list[str]) -> Any:
+    """Mask auth-like header values, every value of an ``env`` block, and long secret strings.
+
+    Short secrets are not substring-replaced: a value like ``1`` would otherwise
+    corrupt every string that happens to contain it.
+    """
     if isinstance(value, dict):
-        return {k: "***" if k.lower() in {"authorization", "cookie", "proxy-authorization"}
-                or k.lower().endswith(("-token", "-key", "-secret"))
-                else mask_secrets(v, secrets) for k, v in value.items()}
+        masked: Json = {}
+        for k, v in value.items():
+            lowered = k.lower()
+            if lowered in {"authorization", "cookie", "proxy-authorization"} or lowered.endswith(("-token", "-key", "-secret")):
+                masked[k] = "***"
+            elif lowered == "env" and isinstance(v, dict):
+                masked[k] = {env_key: "***" for env_key in v}
+            else:
+                masked[k] = mask_secrets(v, secrets)
+        return masked
     if isinstance(value, list):
         return [mask_secrets(item, secrets) for item in value]
     if isinstance(value, str):
         for secret in sorted(set(secrets), key=len, reverse=True):
-            if secret:
+            if len(secret) >= MIN_MASKED_SECRET_LENGTH:
                 value = value.replace(secret, "***")
     return value
 
@@ -434,7 +450,8 @@ class HttpMcpProbe:
         if "Mcp-Session-Id" in resp_headers:
             self.session_id = resp_headers["Mcp-Session-Id"]
 
-        messages = parse_http_body(raw_body, next((v for k, v in resp_headers.items() if k.lower() == "content-type"), "") if self.logger.sink else resp_headers.get("Content-Type", ""))
+        content_type = next((v for k, v in resp_headers.items() if k.lower() == "content-type"), "")
+        messages = parse_http_body(raw_body, content_type)
         for msg in messages:
             self.logger.event("recv", "http", msg, status=status, headers=resp_headers)
         if not messages:
@@ -634,8 +651,8 @@ def load_path(args: argparse.Namespace) -> tuple[Json, list[tuple[int, Json, Any
     require(isinstance(path, dict), "expected an object")
     require(not set(path) - {"name", "description", "server", "handshake", "timeout", "steps"}, "unknown field")
     name = path.get("name")
-    require(isinstance(name, str) and bool(name) and name not in {".", ".."}
-            and "/" not in name and "\\" not in name, "name must be a nonempty filename")
+    require(isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name) is not None,
+            "name must use only letters, digits, '.', '_' or '-' (it becomes the transcript filename)")
     require("description" not in path or isinstance(path["description"], str), "description must be text")
     server = path.get("server", {})
     require(isinstance(server, dict), "server must be an object")
@@ -711,6 +728,22 @@ def load_path(args: argparse.Namespace) -> tuple[Json, list[tuple[int, Json, Any
     return path, expanded, secrets
 
 
+def answers(incoming: Any, message: Any) -> bool:
+    """Whether ``incoming`` is the reply to ``message`` for an awaited step.
+
+    A message without an id (or a non-object payload) accepts the next message.
+    Otherwise the reply must carry the same id, or be an error with ``id: null``,
+    which is how JSON-RPC reports a request it could not attribute.
+    """
+    if not isinstance(message, dict) or "id" not in message:
+        return True
+    if not isinstance(incoming, dict) or "method" in incoming:
+        return False
+    if incoming.get("id") is None:
+        return "error" in incoming
+    return "id" in incoming and ("result" in incoming or "error" in incoming) and incoming["id"] == message["id"]
+
+
 def path_exchange(probe: Any, message: Any, wait: bool, timeout: float) -> tuple[Any, int | None]:
     http = isinstance(probe, HttpMcpProbe)
     response = probe.send(message, timeout) if http else probe.send(message)
@@ -743,7 +776,7 @@ def path_exchange(probe: Any, message: Any, wait: bool, timeout: float) -> tuple
             probe.logger.event("server-request", "http", incoming)
             probe.logger.event("auto-response", "http", reply)
             pending.extend(probe.send(reply, timeout).messages)
-        elif wait and (not isinstance(message, dict) or "id" not in message or (isinstance(incoming, dict) and "id" in incoming and ("result" in incoming or "error" in incoming) and id_of(incoming) == message["id"])):
+        elif wait and answers(incoming, message):
             if not http:
                 return incoming, status
             found = incoming
@@ -779,8 +812,6 @@ def run_path(args: argparse.Namespace) -> int:
                         outcome = "error" if isinstance(result, dict) and "error" in result else "result" if isinstance(result, dict) and "result" in result else "sent"
                     if method_of(message) == "initialize" and transport == "http":
                         probe.protocol_version = negotiated_protocol_version(result, LATEST_PROTOCOL_VERSION)
-                except TimeoutError:
-                    outcome = "timeout"
                 except (OSError, ValueError, http.client.HTTPException) as exc:
                     outcome, failure, code = "closed", str(exc), 3
                 expected = step.get("expect")

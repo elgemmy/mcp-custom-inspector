@@ -17,11 +17,11 @@ In scope (the core):
 - Keep the existing ad-hoc mode (`stdio` / `http` subcommands with `--discover`, `--raw`, `--interactive`) unchanged. It is already tested and useful for poking around before writing a path.
 - Mask secrets (env values, auth-ish headers) in transcripts and summaries.
 
-Out of scope (write these in the README so nobody, human or agent, drifts back into them):
+Out of scope (a hard boundary for humans and agents alike):
 
 - Generating test cases from tool schemas. The agent does this using the skill, from `tools/list` output. If a generator ever exists it is a separate script, not part of the probe.
 - An assertion language beyond the four outcome expectations. Deeper checks are the agent's job reading the summary, or `jq` on the transcript.
-- OAuth, MCP Apps, tasks, subscriptions, sampling, elicitation UI. Server-initiated requests are answered minimally (see 6.4) and logged, nothing more.
+- OAuth, MCP Apps, tasks, subscriptions, sampling, elicitation UI. Server-initiated requests are answered minimally (`ping` and `roots/list` get empty results, anything else gets `-32601`) and logged, nothing more.
 - Conformance grading, compatibility matrices, replay engines, redaction frameworks, multi-server orchestration, a web UI, a package on PyPI.
 - JSON-RPC batching (removed in 2025-06-18). If you want to test a server's reaction to a batch, put a raw array in a step; the probe will send it and record whatever comes back, but it will not parse batch responses.
 - Third-party Python dependencies. Standard library only, Python 3.10+.

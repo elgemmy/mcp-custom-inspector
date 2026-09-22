@@ -63,7 +63,7 @@ Out of scope (write these in the README so nobody, human or agent, drifts back i
 
 Fields:
 
-- `name` (required): used for the transcript file name and diff headers.
+- `name` (required): used for the transcript file name and diff headers. Letters, digits, `.`, `_` and `-` only.
 - `description` (optional).
 - `server` (required unless overridden on the CLI): exactly one of
   - `{"stdio": [argv...], "env": {...}}`
@@ -99,7 +99,7 @@ Validation: the probe validates the path shape before starting the server and ex
 6.3 Steps run strictly in order. For each step: send, then wait according to the rules in section 5, then classify the outcome:
 
 - `result`: a response with the matching id and a `result` member.
-- `error`: a response with the matching id and an `error` member. `error.code` and `error.message` are lifted into the summary.
+- `error`: a response with the matching id and an `error` member, or an `error` response with `id: null` (how JSON-RPC reports a request it could not attribute, for example a 400 "not initialized" over HTTP). `error.code` and `error.message` are lifted into the summary.
 - `timeout`: nothing with that id arrived within `timeout`.
 - `closed`: the server exited or closed the pipe before answering. The stderr tail (last 20 lines, already captured) is attached.
 - `sent`: a notification or unawaited raw send that completed without waiting.
@@ -111,7 +111,7 @@ Validation: the probe validates the path shape before starting the server and ex
 
 6.6 Shutdown: close stdin, wait, SIGTERM, kill, as today. The summary records `server_exit_code` when known.
 
-6.7 Secrets: values of `env` in the path or `--env`, and values of headers whose name matches `authorization`, `cookie`, `proxy-authorization`, or ends with `-token` / `-key` / `-secret` (case-insensitive), are replaced with `"***"` in the transcript and summary. The path file is never rewritten. This is one small function, not a subsystem; it exists so a transcript can go on a slide.
+6.7 Secrets: values of `env` in the path or `--env`, and values of headers whose name matches `authorization`, `cookie`, `proxy-authorization`, or ends with `-token` / `-key` / `-secret` (case-insensitive), are replaced with `"***"` in the transcript and summary. `env` blocks are masked by key; substring replacement elsewhere applies only to values of 8 characters or more, so a short value like `1` cannot corrupt unrelated strings. The path file is never rewritten. This is one small function, not a subsystem; it exists so a transcript can go on a slide.
 
 ## 7. Transcript and summary
 

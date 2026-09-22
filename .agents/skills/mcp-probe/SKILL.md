@@ -22,6 +22,7 @@ or `--interactive` to explore. Move a repeatable experiment into a path.
 ## Path essentials
 
 A JSON object has `name`, `server`, and `steps`; `description` is optional.
+`name` becomes the transcript filename: use kebab-case (letters, digits, `.`, `_`, `-`).
 `server` is either `{"stdio":["command","arg"],"env":{"TOKEN":"dummy"}}`
 or `{"http":"http://127.0.0.1:3000/mcp","headers":{}}`.
 `timeout` is per step, defaults to 15 seconds, and may be overridden on the CLI.
@@ -71,6 +72,8 @@ python3 mcp_probe.py run paths/discover.json --server-cmd -- python3 /path/to/bu
 python3 mcp_probe.py diff RUN_A.jsonl RUN_B.jsonl
 ```
 
+Capture the exit code explicitly (`python3 mcp_probe.py run ...; echo "rc=$?"`) and
+report the number you saw, never one inferred from the summary.
 Use the actual `transcript` paths from the summaries. Place run flags before
 `--server-cmd --`; everything after it belongs to the server.
 `--url`, repeated `--env K=V`, and repeated `--header 'N: V'` override the target.
