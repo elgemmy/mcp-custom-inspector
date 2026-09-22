@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any
 
 
-LATEST_PROTOCOL_VERSION = "2025-06-18"
+LATEST_PROTOCOL_VERSION = "2025-11-25"
 
 
 Json = dict[str, Any]
