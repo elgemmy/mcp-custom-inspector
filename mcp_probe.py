@@ -19,11 +19,11 @@ Examples:
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import datetime as dt
 import json
 import os
 import queue
-import shlex
 import signal
 import subprocess
 import sys
@@ -34,7 +34,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 LATEST_PROTOCOL_VERSION = "2025-06-18"
@@ -44,7 +44,7 @@ Json = dict[str, Any]
 
 
 def now_iso() -> str:
-    return dt.datetime.now(dt.UTC).isoformat(timespec="milliseconds")
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds")
 
 
 def compact_json(value: Any) -> str:
@@ -55,19 +55,39 @@ def pretty_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=False)
 
 
-def load_json_arg(value: str) -> Any:
+def parse_json_text(value: str, label: str) -> Any:
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"{label} contains invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}"
+        ) from exc
+
+
+def load_json_file(path_value: str, label: str) -> Any:
+    try:
+        text = Path(path_value).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(f"Could not read {label} {path_value!r}: {exc.strerror or exc}") from exc
+    return parse_json_text(text, f"{label} {path_value!r}")
+
+
+def load_json_arg(value: str, label: str = "JSON argument") -> Any:
     if value.startswith("@"):
-        return json.loads(Path(value[1:]).read_text(encoding="utf-8"))
-    return json.loads(value)
+        path_value = value[1:]
+        if not path_value:
+            raise SystemExit(f"{label} @file path is empty.")
+        return load_json_file(path_value, label)
+    return parse_json_text(value, label)
 
 
 def load_json_file_or_inline(file_value: str | None, json_value: str | None) -> Any | None:
     if file_value and json_value:
         raise SystemExit("Use either --init-file or --init-json, not both.")
     if file_value:
-        return json.loads(Path(file_value).read_text(encoding="utf-8"))
+        return load_json_file(file_value, "--init-file")
     if json_value:
-        return json.loads(json_value)
+        return parse_json_text(json_value, "--init-json")
     return None
 
 
@@ -115,7 +135,7 @@ class Logger:
 
 
 def default_initialize_params(args: argparse.Namespace) -> Json:
-    capabilities = load_json_arg(args.client_capabilities) if args.client_capabilities else {}
+    capabilities = load_json_arg(args.client_capabilities, "--client-capabilities") if args.client_capabilities else {}
     return {
         "protocolVersion": args.protocol_version,
         "capabilities": capabilities,
@@ -172,6 +192,7 @@ class StdioMcpProbe:
         self._closed = threading.Event()
         self._proc: subprocess.Popen[str] | None = None
         self._next_id = 2
+        self._stderr_tail: deque[str] = deque(maxlen=20)
 
     def start(self) -> None:
         full_env = os.environ.copy()
@@ -203,12 +224,20 @@ class StdioMcpProbe:
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.send_signal(signal.SIGTERM)
+            except OSError:
+                return
             try:
                 proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=2)
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except OSError:
+                    return
+        except OSError:
+            return
 
     def _read_stdout(self) -> None:
         assert self._proc and self._proc.stdout
@@ -228,14 +257,19 @@ class StdioMcpProbe:
     def _read_stderr(self) -> None:
         assert self._proc and self._proc.stderr
         for line in self._proc.stderr:
-            self.logger.event("stderr", "stdio", line.rstrip("\n"))
+            text = line.rstrip("\n")
+            self._stderr_tail.append(text)
+            self.logger.event("stderr", "stdio", text)
 
     def send(self, message: Json) -> None:
         assert self._proc and self._proc.stdin
         payload = compact_json(message)
         self.logger.event("send", "stdio", message)
-        self._proc.stdin.write(payload + "\n")
-        self._proc.stdin.flush()
+        try:
+            self._proc.stdin.write(payload + "\n")
+            self._proc.stdin.flush()
+        except (BrokenPipeError, ValueError) as exc:
+            raise ConnectionError("Server closed its input before the probe could send a message.") from exc
 
     def next_id(self) -> int:
         current = self._next_id
@@ -247,19 +281,32 @@ class StdioMcpProbe:
             return self._responses.pop(request_id)
         deadline = time.monotonic() + timeout
         while True:
+            if self._closed.is_set() and self._messages.empty():
+                raise ConnectionError(self._server_exit_message(request_id))
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"Timed out waiting for response id={request_id!r}")
             try:
-                message = self._messages.get(timeout=remaining)
+                message = self._messages.get(timeout=min(remaining, 0.1))
             except queue.Empty as exc:
-                raise TimeoutError(f"Timed out waiting for response id={request_id!r}") from exc
+                if self._closed.is_set():
+                    raise ConnectionError(self._server_exit_message(request_id)) from exc
+                continue
             if "id" in message and ("result" in message or "error" in message):
                 if message["id"] == request_id:
                     return message
                 self._responses[message["id"]] = message
                 continue
             self._handle_server_message(message)
+
+    def _server_exit_message(self, request_id: Any) -> str:
+        proc = self._proc
+        returncode = proc.poll() if proc else None
+        suffix = f" Server exit code: {returncode}." if returncode is not None else ""
+        stderr = "\n".join(self._stderr_tail)
+        if stderr:
+            return f"Server exited before responding to id={request_id!r}.{suffix}\nServer stderr tail:\n{stderr}"
+        return f"Server exited before responding to id={request_id!r}.{suffix}"
 
     def _handle_server_message(self, message: Json) -> None:
         if "id" not in message or "method" not in message:
@@ -435,7 +482,7 @@ def run_stdio(args: argparse.Namespace) -> int:
             discover_stdio(probe, args)
 
         for raw in args.raw or []:
-            message = load_json_arg(raw)
+            message = load_json_arg(raw, "--raw")
             if not isinstance(message, dict):
                 raise SystemExit("--raw must be a JSON-RPC object.")
             probe.send(message)
@@ -471,20 +518,21 @@ def interactive_stdio(probe: StdioMcpProbe, timeout: float) -> None:
                 if isinstance(msg, dict) and "id" in msg:
                     print_response(f"raw id={msg['id']}", probe.wait_for_response(msg["id"], timeout))
             elif line.startswith("notify "):
-                parts = shlex.split(line)
-                if len(parts) < 2:
+                rest = line[len("notify "):].strip()
+                if not rest:
                     print("usage: notify method [json-params]")
                     continue
-                params = json.loads(parts[2]) if len(parts) > 2 else None
-                msg: Json = {"jsonrpc": "2.0", "method": parts[1]}
+                method, _, params_text = rest.partition(" ")
+                params = json.loads(params_text) if params_text.strip() else None
+                msg: Json = {"jsonrpc": "2.0", "method": method}
                 if params is not None:
                     msg["params"] = params
                 probe.send(msg)
             else:
-                parts = shlex.split(line)
-                params = json.loads(parts[1]) if len(parts) > 1 else {}
-                response = probe.rpc(parts[0], params, timeout)
-                print_response(parts[0], response)
+                method, _, params_text = line.partition(" ")
+                params = json.loads(params_text) if params_text.strip() else {}
+                response = probe.rpc(method, params, timeout)
+                print_response(method, response)
         except Exception as exc:
             print(f"error: {exc}", file=sys.stderr)
 
@@ -492,41 +540,38 @@ def interactive_stdio(probe: StdioMcpProbe, timeout: float) -> None:
 def run_http(args: argparse.Namespace) -> int:
     logger = Logger(args.verbose)
     probe = HttpMcpProbe(args.url, parse_header(args.header), logger)
-    try:
-        init = initialize_request(args)
-        init_response = probe.send(init, args.timeout, include_protocol_header=args.include_protocol_header_on_initialize)
-        print_response("initialize", {
-            "status": init_response.status,
-            "headers": init_response.headers,
-            "messages": init_response.messages,
-            "raw": init_response.raw_body,
+    init = initialize_request(args)
+    init_response = probe.send(init, args.timeout, include_protocol_header=args.include_protocol_header_on_initialize)
+    print_response("initialize", {
+        "status": init_response.status,
+        "headers": init_response.headers,
+        "messages": init_response.messages,
+        "raw": init_response.raw_body,
+    })
+
+    if init_response.messages:
+        probe.protocol_version = negotiated_protocol_version(init_response.messages[-1], args.protocol_version)
+    else:
+        probe.protocol_version = args.protocol_version
+
+    if not args.no_initialized:
+        probe.send(initialized_notification(), args.timeout)
+
+    if args.discover:
+        discover_http(probe, args)
+
+    for raw in args.raw or []:
+        message = load_json_arg(raw, "--raw")
+        if not isinstance(message, dict):
+            raise SystemExit("--raw must be a JSON-RPC object.")
+        response = probe.send(message, args.timeout)
+        print_response(f"raw {method_of(message) or id_of(message)}", {
+            "status": response.status,
+            "headers": response.headers,
+            "messages": response.messages,
+            "raw": response.raw_body,
         })
-
-        if init_response.messages:
-            probe.protocol_version = negotiated_protocol_version(init_response.messages[-1], args.protocol_version)
-        else:
-            probe.protocol_version = args.protocol_version
-
-        if not args.no_initialized:
-            probe.send(initialized_notification(), args.timeout)
-
-        if args.discover:
-            discover_http(probe, args)
-
-        for raw in args.raw or []:
-            message = load_json_arg(raw)
-            if not isinstance(message, dict):
-                raise SystemExit("--raw must be a JSON-RPC object.")
-            response = probe.send(message, args.timeout)
-            print_response(f"raw {method_of(message) or id_of(message)}", {
-                "status": response.status,
-                "headers": response.headers,
-                "messages": response.messages,
-                "raw": response.raw_body,
-            })
-        return 0
-    finally:
-        pass
+    return 0
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -581,7 +626,31 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return int(args.func(args) or 0)
+    try:
+        return int(args.func(args) or 0)
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        return 130
+    except urllib.error.URLError as exc:
+        print(f"HTTP error: {exc.reason}", file=sys.stderr)
+        return 1
+    except TimeoutError as exc:
+        print(f"Timeout: {exc}", file=sys.stderr)
+        return 1
+    except FileNotFoundError as exc:
+        print(f"File not found: {exc.filename or exc}", file=sys.stderr)
+        return 1
+    except json.JSONDecodeError as exc:
+        print(f"Invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}", file=sys.stderr)
+        return 1
+    except (BrokenPipeError, ConnectionError) as exc:
+        print(f"Connection error: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"OS error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

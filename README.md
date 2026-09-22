@@ -129,6 +129,8 @@ Then review the generated command before running it, especially any tokens or sh
 
 ## Notes
 
+- Requires Python 3.10+ and only uses the standard library.
 - Use dummy tokens when only testing the MCP handshake.
 - Use real tokens only when you intentionally want to inspect authenticated tools or resources.
 - Use `--verbose` when you want to see every raw send/receive event.
+- JSON-RPC batch arrays are intentionally not handled; MCP protocol version `2025-06-18` removed batching.

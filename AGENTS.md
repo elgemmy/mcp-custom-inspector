@@ -88,7 +88,9 @@ Prefer these examples when asked for runnable flows:
 ## Editing Guidance
 
 - Keep `mcp_probe.py` dependency-free and standard-library only.
+- Target Python 3.10+ and avoid APIs that require newer Python versions unless documented.
 - Use small explicit JSON-RPC helpers rather than broad abstractions.
+- Do not add JSON-RPC batch handling unless explicitly requested; MCP protocol version `2025-06-18` removed batching.
 - Add new payload examples under `examples/` when they represent reusable scenarios.
 - Add or update a recipe when a new server flow is tested by hand.
 - Do not commit real API tokens, bearer tokens, private endpoints, or sensitive response data.
