@@ -111,27 +111,60 @@ def parse_header(values: list[str] | None) -> dict[str, str]:
     return parsed
 
 
+def mask_secrets(value: Any, secrets: list[str]) -> Any:
+    if isinstance(value, dict):
+        return {k: "***" if k.lower() in {"authorization", "cookie", "proxy-authorization"}
+                or k.lower().endswith(("-token", "-key", "-secret"))
+                else mask_secrets(v, secrets) for k, v in value.items()}
+    if isinstance(value, list):
+        return [mask_secrets(item, secrets) for item in value]
+    if isinstance(value, str):
+        for secret in sorted(set(secrets), key=len, reverse=True):
+            if secret:
+                value = value.replace(secret, "***")
+    return value
+
+
 class Logger:
-    def __init__(self, verbose: bool) -> None:
+    def __init__(self, verbose: bool, sink: Any = None, secrets: list[str] | None = None) -> None:
         self.verbose = verbose
+        self.sink = sink
+        self.secrets = secrets or []
+        self.step: int | None = None
         self._lock = threading.Lock()
 
     def event(self, direction: str, transport: str, payload: Any, **meta: Any) -> None:
-        if not self.verbose:
+        if not self.verbose and self.sink is None:
             return
         record = {
             "ts": now_iso(),
             "direction": direction,
             "transport": transport,
             "payload": payload,
+            **({"step": self.step} if self.step is not None else {}),
             **{k: v for k, v in meta.items() if v is not None},
         }
+        if self.sink is not None:
+            record = mask_secrets(record, self.secrets)
+            payload = record["payload"]
         prefix = f"[{record['ts']}] {direction.upper()} {transport}"
         with self._lock:
+            if self.sink is not None:
+                self.sink.write(compact_json(record) + "\n")
+                self.sink.flush()
+            if not self.verbose:
+                return
             if direction == "stderr":
                 print(f"{prefix}: {payload}", file=sys.stderr)
             else:
                 print(f"{prefix}:\n{pretty_json(payload)}", file=sys.stderr)
+
+    def summary(self, value: Json) -> Json:
+        masked = mask_secrets(value, self.secrets)
+        with self._lock:
+            self.sink.write(compact_json({"summary": masked}) + "\n")
+            self.sink.flush()
+        return masked
 
 
 def default_initialize_params(args: argparse.Namespace) -> Json:
