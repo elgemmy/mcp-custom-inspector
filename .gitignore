@@ -6,8 +6,8 @@ __pycache__/
 venv/
 
 # Local evidence logs. Keep them private unless intentionally redacted.
-transcripts/*.jsonl
-!transcripts/.gitkeep
+runs/*
+!runs/.gitkeep
 
 # Local env/secrets used by MCP servers.
 .env

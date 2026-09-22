@@ -1,105 +1,59 @@
 # Agent Guide
 
-This repo is a small MCP probe for sending controlled JSON-RPC requests to MCP servers. Keep it simple and command-oriented.
+MCP Probe is a small MCP client for sending controlled JSON-RPC messages.
+It runs paths, records transcripts, and compares outcomes over stdio or Streamable HTTP.
+Keep it a single-file, standard-library tool that agents and people can read.
 
-## Project Shape
+## Scope
 
-- `mcp_probe.py` is the single Python CLI entry point.
-- `examples/` contains reusable initialize payloads.
-- `recipes/` contains hand-run examples for tested local flows.
-- There is no package manager setup and no third-party Python dependency list.
+In scope (the core):
 
-Keep the tool lean: prefer printed output, tested npm/local recipes, and small explicit helpers unless the user explicitly asks for more.
+- Execute a path file against one server over stdio or Streamable HTTP.
+- Verbatim sends: what is in the file is what goes on the wire, including malformed JSON-RPC.
+- A sugar step for well-formed requests so common paths stay short.
+- Record a JSONL transcript per run and print a JSON summary per step.
+- Optional per-step expectations (result / error / none / timeout) that flip the exit code.
+- Diff two transcripts, aligned by step, ignoring volatile fields.
+- Keep the existing ad-hoc mode (`stdio` / `http` subcommands with `--discover`, `--raw`, `--interactive`) unchanged. It is already tested and useful for poking around before writing a path.
+- Mask secrets (env values, auth-ish headers) in transcripts and summaries.
 
-## Core Commands
+Out of scope (write these in the README so nobody, human or agent, drifts back into them):
 
-Check the CLI:
+- Generating test cases from tool schemas. The agent does this using the skill, from `tools/list` output. If a generator ever exists it is a separate script, not part of the probe.
+- An assertion language beyond the four outcome expectations. Deeper checks are the agent's job reading the summary, or `jq` on the transcript.
+- OAuth, MCP Apps, tasks, subscriptions, sampling, elicitation UI. Server-initiated requests are answered minimally (see 6.4) and logged, nothing more.
+- Conformance grading, compatibility matrices, replay engines, redaction frameworks, multi-server orchestration, a web UI, a package on PyPI.
+- JSON-RPC batching (removed in 2025-06-18). If you want to test a server's reaction to a batch, put a raw array in a step; the probe will send it and record whatever comes back, but it will not parse batch responses.
+- Third-party Python dependencies. Standard library only, Python 3.10+.
+- Splitting `mcp_probe.py` into a package. One file until it passes roughly 1,200 lines, and even then only into two or three modules.
 
-```bash
-python3 mcp_probe.py --help
-python3 mcp_probe.py stdio --help
-python3 mcp_probe.py http --help
-```
+## Layout
 
-Run a syntax check after editing Python:
+- `mcp_probe.py`: the Python 3.10+ CLI.
+- `paths/`: nine curated paths, also the verification suite.
+- `examples/`: initialize payloads for ad-hoc mode.
+- `runs/`: local transcripts, ignored except `.gitkeep`.
+- `.agents/skills/mcp-probe/SKILL.md`: usage instructions.
+- `.claude/skills/mcp-probe`: relative symlink to that skill.
+- `AGENTS.md` / `CLAUDE.md`: developer guide and its import.
+- `README.md`, `CONTRIBUTING.md`, `LICENSE`, `SPEC.md`: project references.
 
-```bash
-python3 -m py_compile mcp_probe.py
-```
+## Verify a change
 
-Run a basic npm stdio discovery smoke test:
+Run `python3 -m py_compile mcp_probe.py`.
+Run `python3 mcp_probe.py run paths/discover.json` and `python3 mcp_probe.py run paths/handshake-missing-protocol-version.json` against the Everything server; both should exit 0.
+Run all nine curated paths before a PR and check their expectations.
+Run `python3 mcp_probe.py run paths/handshake-valid.json`, then `python3 mcp_probe.py diff VALID.jsonl MISSING.jsonl` using the transcript paths from the summaries; expect exit 2 and one differing step.
+The paths are the tests. Do not add pytest, `tests/`, or `scripts/`.
 
-```bash
-python3 mcp_probe.py stdio --init-file examples/init-valid.json --discover --verbose -- npx -y @modelcontextprotocol/server-everything
-```
+## Editing rules
 
-Test a missing `protocolVersion` initialize payload:
+- Standard library only; Python 3.10+; keep `mcp_probe.py` one file.
+- Prefer small explicit helpers and preserve the existing ad-hoc commands.
+- Do not parse JSON-RPC batches; raw array sends remain possible.
+- Never commit tokens or unmasked transcripts.
+- If a change adds more than ~150 lines to `mcp_probe.py`, stop and ask whether it belongs in a separate script or not at all.
 
-```bash
-python3 mcp_probe.py stdio --init-file examples/init-missing-protocol-version.json --no-initialized --verbose -- npx -y @modelcontextprotocol/server-everything
-```
+## Commit style
 
-Test Notion initialize behavior without calling real Notion tools:
-
-```bash
-python3 mcp_probe.py stdio --init-file examples/init-valid.json --no-initialized --verbose --env NOTION_TOKEN=dummy -- npx -y @notionhq/notion-mcp-server
-```
-
-Call a tool with a raw JSON-RPC request:
-
-```bash
-python3 mcp_probe.py stdio --init-file examples/init-valid.json --raw '{"jsonrpc":"2.0","id":99,"method":"tools/list","params":{}}' --verbose -- npx -y package-name
-```
-
-## Command Generation Rules
-
-When generating commands for users:
-
-- Put all `mcp_probe.py` flags before the final `--`.
-- Put the MCP server command after the final `--`.
-- Prefer one-line commands to avoid shell continuation mistakes.
-- Use `--verbose` when the user wants raw send/receive visibility.
-- Use dummy tokens for handshake-only tests.
-- Use real tokens only when the user intentionally wants authenticated tool/resource inspection.
-- Keep raw JSON-RPC objects valid JSON, usually single-quoted at the shell level.
-
-Good shape:
-
-```bash
-python3 mcp_probe.py stdio --init-file examples/init-valid.json --discover --verbose -- npx -y package-name
-```
-
-Bad shape:
-
-```bash
-python3 mcp_probe.py stdio -- npx -y package-name --discover
-```
-
-## Tested Local Recipes
-
-Prefer these examples when asked for runnable flows:
-
-- `recipes/notion.md`: initialize compatibility check against Notion.
-- `recipes/everything.md`: discovery against the MCP Everything test server.
-- `recipes/memory.md`: discovery and structured tool calls.
-- `recipes/filesystem.md`: safe local filesystem tool calls.
-- `recipes/generic.md`: generic npm stdio and HTTP templates.
-
-## Editing Guidance
-
-- Keep `mcp_probe.py` dependency-free and standard-library only.
-- Target Python 3.10+ and avoid APIs that require newer Python versions unless documented.
-- Use small explicit JSON-RPC helpers rather than broad abstractions.
-- Do not add JSON-RPC batch handling unless explicitly requested; MCP protocol version `2025-06-18` removed batching.
-- Add new payload examples under `examples/` when they represent reusable scenarios.
-- Add or update a recipe when a new server flow is tested by hand.
-- Do not commit real API tokens, bearer tokens, private endpoints, or sensitive response data.
-
-## Commit Style
-
-Use short imperative commit subjects, for example:
-
-```text
-Add filesystem recipe
-Simplify initialize handling
-```
+Use short imperative subjects, such as `Add path runner` or `Simplify transcript diff`.
