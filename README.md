@@ -1,136 +1,81 @@
 # MCP Probe
 
-A tiny MCP client for sending custom JSON-RPC requests to MCP servers and printing the exact responses.
+MCP Probe runs a *path* (an ordered list of JSON-RPC messages, well-formed or not) against an MCP server, records the transcript, and lets you diff two transcripts. You or your agent compose the path; the probe executes and reports.
 
-The official MCP Inspector is excellent for normal interactive testing, but it does not expose full control over the `initialize` payload. This tool is for protocol-level checks, demos, and compatibility evidence.
+## Why it exists
 
-It is intentionally small: one Python script, no third-party Python dependencies.
+The [official MCP Inspector](https://github.com/modelcontextprotocol/inspector) provides a guided client for well-formed requests. MCP Probe sends the messages you wrote, including deliberately broken JSON-RPC, so you can see how a server responds. Happy paths and failure paths use the same mechanism.
 
-## What It Does
+## Quick start
 
-- Launches stdio MCP servers, such as npm-based local servers.
-- Sends a custom `initialize` request from a JSON file or inline JSON.
-- Optionally sends `notifications/initialized`.
-- Sends raw JSON-RPC objects with `--raw`.
-- Can run simple discovery calls: `tools/list`, `resources/list`, and `prompts/list`.
-- Includes basic Streamable HTTP probing for HTTP MCP endpoints.
-
-This is not built on top of MCP Inspector. It is a small MCP client/probe.
-
-## Quick Start
-
-Run from this repository:
+These paths use the Everything example server and need Node/npm for that server:
 
 ```bash
-python3 mcp_probe.py stdio --init-file examples/init-valid.json --no-initialized --verbose --env NOTION_TOKEN=dummy -- npx -y @notionhq/notion-mcp-server
+python3 mcp_probe.py run paths/handshake-valid.json
+python3 mcp_probe.py run paths/handshake-missing-protocol-version.json
+python3 mcp_probe.py diff runs/handshake-valid-*.jsonl runs/handshake-missing-protocol-version-*.jsonl
 ```
 
-Then run the same server with a deliberately invalid initialize payload:
+Both runs should exit 0: the first expects a result, the second an error. Diff exits 2 and reports one differing step. After repeated runs, replace the two globs with the exact `transcript` paths printed in the summaries.
 
-```bash
-python3 mcp_probe.py stdio --init-file examples/init-missing-protocol-version.json --no-initialized --verbose --env NOTION_TOKEN=dummy -- npx -y @notionhq/notion-mcp-server
-```
-
-The first run should show a successful `initialize` response with a `result`. The second run should show a JSON-RPC `error` response if the server enforces the required `protocolVersion`.
-
-## Example Payloads
-
-- `examples/init-valid.json`: minimal valid initialize params.
-- `examples/init-missing-protocol-version.json`: initialize params missing `protocolVersion`.
-- `examples/init-custom-client-capabilities.json`: example with non-empty client capabilities.
-
-`--init-file` accepts either an initialize params object:
+## Path format
 
 ```json
 {
-  "protocolVersion": "2025-06-18",
-  "capabilities": {},
-  "clientInfo": {
-    "name": "mcp-compat-probe",
-    "version": "0.1.0"
-  }
-}
-```
-
-Or a full JSON-RPC initialize request object:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "initialize",
-  "params": {
-    "protocolVersion": "2025-06-18",
-    "capabilities": {},
-    "clientInfo": {
-      "name": "mcp-compat-probe",
-      "version": "0.1.0"
+  "name": "missing-protocol-version",
+  "server": {"stdio": ["npx", "-y", "@modelcontextprotocol/server-everything"]},
+  "handshake": false,
+  "timeout": 15,
+  "steps": [
+    {
+      "send": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "capabilities": {},
+          "clientInfo": {"name": "mcp-probe", "version": "0.2.0"}
+        }
+      },
+      "expect": "error"
     }
-  }
+  ]
 }
 ```
 
-## Common Usage
+Raw `send` accepts any JSON value. The other step shape, `{"method":"tools/list","params":{}}`, supplies JSON-RPC framing and an ID; `notify:true` omits the ID. Optional expectations are exactly `result`, `error`, `none`, and `timeout`. No expectation means record only. Use `wait:true` to observe silence after a notification; `none` and `timeout` both match a timeout.
 
-List tools, resources, and prompts after initialization:
+Automatic handshake is the default unless a step sends initialize. Set `handshake:false` to send only your written sequence, or supply an initialize-params object. A server block can also contain `http` and `headers`. See [SPEC.md](SPEC.md) for the durable format and semantics.
 
+Summaries are JSON on stdout, progress is on stderr, and transcripts stay in gitignored `runs/`. Diff compares step outcomes, HTTP statuses, errors, result keys, and the server exit code. Text output counts differing steps; `--json` lists changed fields. Exit codes are 0 for success, 1 for input/startup errors, 2 for mismatches/differences, and 3 for an aborted run.
+
+## Ad-hoc mode
+
+Explore before writing a path; the existing commands remain available:
 ```bash
-python3 mcp_probe.py stdio --init-file examples/init-valid.json --discover --verbose -- npx -y package-name
+python3 mcp_probe.py stdio --discover --verbose -- npx -y @modelcontextprotocol/server-everything
+python3 mcp_probe.py http --url http://127.0.0.1:3000/mcp --discover
 ```
+Use `--raw`, `--init-file`, or stdio `--interactive` for one-off experiments.
 
-Send a raw JSON-RPC request:
+## Using it with an agent
 
-```bash
-python3 mcp_probe.py stdio --init-file examples/init-valid.json --raw '{"jsonrpc":"2.0","id":99,"method":"tools/list","params":{}}' --verbose -- npx -y package-name
-```
+The [MCP Probe usage skill](.agents/skills/mcp-probe/SKILL.md) explains how to compose paths, choose failure cases, run target overrides, and read the evidence. Claude Code uses the relative symlink under `.claude/skills/`.
 
-Open a small interactive prompt after initialization:
+Example prompt: “Write a path that checks whether this server survives a request with no jsonrpc field and can still list tools afterwards.”
 
-```bash
-python3 mcp_probe.py stdio --init-file examples/init-valid.json --interactive -- npx -y package-name
-```
+The nine files in `paths/` are reusable examples and the verification suite. The skill also shows how to run the missing-version path against Notion with a dummy token; initialize payloads for ad-hoc use remain in `examples/`.
 
-Inside interactive mode:
+## Scope and non-goals
 
-```text
-mcp> tools/list {}
-mcp> resources/list {}
-mcp> raw {"jsonrpc":"2.0","id":10,"method":"prompts/list","params":{}}
-mcp> quit
-```
+One server, an ordered path, exact JSON sends, optional outcome expectations, local transcripts, and a shallow diff. The client answers server requests minimally and masks supplied env values and auth-like headers in run artifacts. Arbitrary response data can still be private; never commit credentials or unmasked transcripts.
 
-## Tested Local Flows
+There is no test-case generator, assertion language, OAuth, MCP Apps, tasks, subscriptions, sampling or elicitation workflow, conformance grading, compatibility matrix, replay engine, redaction framework, multi-server orchestration, web UI, or PyPI package. Raw arrays can be sent, but batch responses are not parsed. Full result comparisons belong to the agent or `jq`.
 
-See `recipes/` for simple flows you can run by hand:
+## Requirements
 
-- `recipes/notion.md`: initialize compatibility check against Notion.
-- `recipes/everything.md`: discovery against the MCP Everything test server.
-- `recipes/memory.md`: discovery and real tool calls against Memory.
-- `recipes/filesystem.md`: discovery and safe local file reads against Filesystem.
-- `recipes/generic.md`: templates for npm stdio and HTTP endpoints.
+Python 3.10+; standard library only. There is no package setup or Python dependency installation. The target server supplies its own runtime requirements. See [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) for development and verification.
 
-## HTTP Endpoint Example
+## License
 
-For Streamable HTTP servers:
-
-```bash
-python3 mcp_probe.py http --url http://127.0.0.1:3000/mcp --init-file examples/init-valid.json --discover --header 'Authorization: Bearer YOUR_TOKEN' --verbose
-```
-
-## Asking an Agent for a Command
-
-This repo works well with coding agents. Ask the agent for a command like:
-
-```text
-Generate an mcp_probe.py command that launches an npm-based MCP server and sends examples/init-missing-protocol-version.json as the initialize payload. Include any required env vars as --env placeholders.
-```
-
-Then review the generated command before running it, especially any tokens or shell arguments.
-
-## Notes
-
-- Requires Python 3.10+ and only uses the standard library.
-- Use dummy tokens when only testing the MCP handshake.
-- Use real tokens only when you intentionally want to inspect authenticated tools or resources.
-- Use `--verbose` when you want to see every raw send/receive event.
-- JSON-RPC batch arrays are intentionally not handled; MCP protocol version `2025-06-18` removed batching.
+[MIT](LICENSE), copyright 2026 Ahmed Gamal.
