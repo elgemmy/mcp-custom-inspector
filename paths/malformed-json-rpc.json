@@ -1,0 +1,9 @@
+{
+  "name": "malformed-json-rpc",
+  "description": "Record a request without the jsonrpc field",
+  "server": {"stdio": ["npx", "-y", "@modelcontextprotocol/server-everything"]},
+  "handshake": "auto",
+  "steps": [
+    {"send": {"id": 5, "method": "tools/list"}, "wait": true}
+  ]
+}

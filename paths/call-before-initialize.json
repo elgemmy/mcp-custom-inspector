@@ -1,0 +1,9 @@
+{
+  "name": "call-before-initialize",
+  "description": "Record tools/list before initialization",
+  "server": {"stdio": ["npx", "-y", "@modelcontextprotocol/server-everything"]},
+  "handshake": false,
+  "steps": [
+    {"method": "tools/list"}
+  ]
+}

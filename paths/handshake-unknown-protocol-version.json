@@ -1,0 +1,9 @@
+{
+  "name": "handshake-unknown-protocol-version",
+  "description": "Record negotiation for an unknown protocol version",
+  "server": {"stdio": ["npx", "-y", "@modelcontextprotocol/server-everything"]},
+  "handshake": false,
+  "steps": [
+    {"send": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "1999-01-01", "capabilities": {}, "clientInfo": {"name": "mcp-probe", "version": "0.2.0"}}}}
+  ]
+}

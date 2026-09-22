@@ -1,0 +1,11 @@
+{
+  "name": "discover",
+  "description": "List available tools, resources, and prompts",
+  "server": {"stdio": ["npx", "-y", "@modelcontextprotocol/server-everything"]},
+  "handshake": "auto",
+  "steps": [
+    {"method": "tools/list", "expect": "result"},
+    {"method": "resources/list", "expect": "result"},
+    {"method": "prompts/list", "expect": "result"}
+  ]
+}

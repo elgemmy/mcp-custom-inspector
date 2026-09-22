@@ -1,0 +1,9 @@
+{
+  "name": "tool-call-missing-required-arg",
+  "description": "Record how echo handles its missing required argument",
+  "server": {"stdio": ["npx", "-y", "@modelcontextprotocol/server-everything"]},
+  "handshake": "auto",
+  "steps": [
+    {"method": "tools/call", "params": {"name": "echo", "arguments": {}}}
+  ]
+}

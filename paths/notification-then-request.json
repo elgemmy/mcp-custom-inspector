@@ -1,0 +1,11 @@
+{
+  "name": "notification-then-request",
+  "description": "Send initialized twice after the automatic handshake, then list tools",
+  "server": {"stdio": ["npx", "-y", "@modelcontextprotocol/server-everything"]},
+  "handshake": "auto",
+  "steps": [
+    {"method": "notifications/initialized", "notify": true},
+    {"method": "notifications/initialized", "notify": true},
+    {"method": "tools/list", "expect": "result"}
+  ]
+}

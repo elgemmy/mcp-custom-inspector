@@ -1,0 +1,9 @@
+{
+  "name": "handshake-missing-protocol-version",
+  "description": "Reject initialize without protocolVersion; also usable with Notion and a dummy token",
+  "server": {"stdio": ["npx", "-y", "@modelcontextprotocol/server-everything"]},
+  "handshake": false,
+  "steps": [
+    {"send": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {}, "clientInfo": {"name": "mcp-probe", "version": "0.2.0"}}}, "expect": "error"}
+  ]
+}

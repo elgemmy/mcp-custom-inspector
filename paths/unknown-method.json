@@ -1,0 +1,9 @@
+{
+  "name": "unknown-method",
+  "description": "Reject an unknown method",
+  "server": {"stdio": ["npx", "-y", "@modelcontextprotocol/server-everything"]},
+  "handshake": "auto",
+  "steps": [
+    {"method": "foo/bar", "expect": "error"}
+  ]
+}

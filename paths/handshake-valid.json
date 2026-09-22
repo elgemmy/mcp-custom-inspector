@@ -1,0 +1,9 @@
+{
+  "name": "handshake-valid",
+  "description": "Initialize with all required fields",
+  "server": {"stdio": ["npx", "-y", "@modelcontextprotocol/server-everything"]},
+  "handshake": false,
+  "steps": [
+    {"send": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "mcp-probe", "version": "0.2.0"}}}, "expect": "result"}
+  ]
+}
