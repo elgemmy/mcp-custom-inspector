@@ -16,12 +16,13 @@ In scope (the core):
 - Diff two transcripts, aligned by step, ignoring volatile fields.
 - Keep the existing ad-hoc mode (`stdio` / `http` subcommands with `--discover`, `--raw`, `--interactive`) unchanged. It is already tested and useful for poking around before writing a path.
 - Mask secrets (env values, auth-ish headers) in transcripts and summaries.
+- A `login` subcommand that gets an OAuth access token for an HTTP server (discovery, dynamic client registration, authorization code + PKCE) and prints it for `--header`. Nothing more: no token storage or refresh, and no other auth flows.
 
 Out of scope (a hard boundary for humans and agents alike):
 
 - Generating test cases from tool schemas. The agent does this using the skill, from `tools/list` output. If a generator ever exists it is a separate script, not part of the probe.
 - An assertion language beyond the four outcome expectations. Deeper checks are the agent's job reading the summary, or `jq` on the transcript.
-- OAuth, MCP Apps, tasks, subscriptions, sampling, elicitation UI. Server-initiated requests are answered minimally (`ping` and `roots/list` get empty results, anything else gets `-32601`) and logged, nothing more.
+- OAuth beyond `login` (token caching, refresh, client credentials, pre-registered clients), MCP Apps, tasks, subscriptions, sampling, elicitation UI. Server-initiated requests are answered minimally (`ping` and `roots/list` get empty results, anything else gets `-32601`) and logged, nothing more.
 - Conformance grading, compatibility matrices, replay engines, redaction frameworks, multi-server orchestration, a web UI, a package on PyPI.
 - JSON-RPC batching (removed in 2025-06-18). If you want to test a server's reaction to a batch, put a raw array in a step; the probe will send it and record whatever comes back, but it will not parse batch responses.
 - Third-party Python dependencies. Standard library only, Python 3.10+.

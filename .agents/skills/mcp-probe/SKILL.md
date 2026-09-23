@@ -77,6 +77,15 @@ report the number you saw, never one inferred from the summary.
 Use the actual `transcript` paths from the summaries. Place run flags before
 `--server-cmd --`; everything after it belongs to the server.
 `--url`, repeated `--env K=V`, and repeated `--header 'N: V'` override the target.
+For an OAuth-protected HTTP server, get a token first; the user approves in the browser,
+and the token goes to a file so it never lands in the conversation:
+
+```bash
+python3 mcp_probe.py login --url https://example.com/mcp > TOKEN_FILE
+python3 mcp_probe.py run PATH --header "Authorization: Bearer $(cat TOKEN_FILE)"
+```
+
+`login` needs the server to support dynamic client registration and waits up to 300 seconds for the callback on `127.0.0.1:8765`.
 When you start an HTTP server yourself, keep its PID and stop its whole process tree (`npx` spawns a child `node`);
 never `pkill -f` a pattern that could also match your own session.
 `--out DIR` changes the transcript directory; `--quiet` suppresses step lines.

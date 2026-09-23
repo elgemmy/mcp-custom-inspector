@@ -14,18 +14,24 @@ Examples:
     --url http://127.0.0.1:3000/mcp \
     --discover \
     --header 'Authorization: Bearer ...'
+
+  TOKEN=$(python mcp_probe.py login --url https://example.com/mcp)
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import deque
 import datetime as dt
+import hashlib
 import json
 import http.client
+import http.server
 import os
 import queue
 import re
+import secrets
 import signal
 import subprocess
 import sys
@@ -34,6 +40,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -910,6 +917,128 @@ def diff_runs(args: argparse.Namespace) -> int:
     return 2 if differences else 0
 
 
+def http_json(url: str, form: dict[str, str] | None = None, body: Json | None = None) -> Json:
+    headers = {"Accept": "application/json"}
+    data = None
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    elif body is not None:
+        data = compact_json(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise SystemExit(f"OAuth request to {url} failed with HTTP {exc.code}: {exc.read().decode('utf-8', 'replace')[:300]}")
+
+
+def well_known(url: str, suffix: str) -> str:
+    parts = urllib.parse.urlsplit(url)
+    path = parts.path.rstrip("/")
+    return f"{parts.scheme}://{parts.netloc}/.well-known/{suffix}{path}"
+
+
+def first_json(urls: list[str]) -> Json:
+    for url in urls:
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"Accept": "application/json"}), timeout=15) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.HTTPError, json.JSONDecodeError):
+            continue
+    raise SystemExit(f"OAuth metadata not found at: {', '.join(urls)}")
+
+
+def oauth_login(args: argparse.Namespace) -> int:
+    """Authorization code + PKCE with dynamic client registration; prints the access token."""
+    origin = "{0.scheme}://{0.netloc}".format(urllib.parse.urlsplit(args.url))
+    resource_urls = [well_known(args.url, "oauth-protected-resource"), well_known(origin, "oauth-protected-resource")]
+    try:
+        urllib.request.urlopen(urllib.request.Request(args.url, data=b"{}", headers={"Content-Type": "application/json"}), timeout=15)
+    except urllib.error.HTTPError as exc:
+        match = re.search(r'resource_metadata="([^"]+)"', exc.headers.get("WWW-Authenticate", ""))
+        if match:
+            resource_urls.insert(0, match.group(1))
+    resource = first_json([u for u in resource_urls if u])
+    issuer = resource["authorization_servers"][0]
+    meta = first_json([well_known(issuer, "oauth-authorization-server"), well_known(issuer, "openid-configuration")])
+    if "registration_endpoint" not in meta:
+        raise SystemExit("Authorization server has no registration_endpoint; dynamic client registration is required.")
+
+    redirect_uri = f"http://127.0.0.1:{args.port}/callback"
+    client = http_json(meta["registration_endpoint"], body={
+        "client_name": "mcp-probe",
+        "redirect_uris": [redirect_uri],
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    })
+    verifier = secrets.token_urlsafe(48)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(16)
+    scope = args.scope or " ".join(resource.get("scopes_supported") or meta.get("scopes_supported") or [])
+    query = {
+        "response_type": "code",
+        "client_id": client["client_id"],
+        "redirect_uri": redirect_uri,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+        "resource": resource.get("resource", args.url),
+    }
+    if scope:
+        query["scope"] = scope
+    auth_url = f"{meta['authorization_endpoint']}?{urllib.parse.urlencode(query)}"
+
+    received: dict[str, str] = {}
+
+    class Callback(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            parts = urllib.parse.urlsplit(self.path)
+            if parts.path != "/callback":
+                self.send_response(404)
+                self.end_headers()
+                return
+            received.update(dict(urllib.parse.parse_qsl(parts.query)))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"MCP Probe login finished; you can close this tab.")
+
+        def log_message(self, *_: Any) -> None:
+            pass
+
+    with http.server.HTTPServer(("127.0.0.1", args.port), Callback) as server:
+        print(f"Open this URL to authorize:\n{auth_url}", file=sys.stderr)
+        webbrowser.open(auth_url)
+        deadline = time.monotonic() + args.timeout
+        while not received and time.monotonic() < deadline:
+            server.timeout = max(deadline - time.monotonic(), 0.1)
+            server.handle_request()
+    if not received:
+        raise SystemExit("Authorization timed out waiting for the browser callback.")
+
+    if "error" in received:
+        raise SystemExit(f"Authorization failed: {received['error']} {received.get('error_description', '')}".strip())
+    if received.get("state") != state:
+        raise SystemExit("Authorization failed: state mismatch.")
+    if "iss" in received and received["iss"] != meta.get("issuer"):
+        raise SystemExit("Authorization failed: issuer mismatch.")
+
+    token = http_json(meta["token_endpoint"], form={
+        "grant_type": "authorization_code",
+        "code": received["code"],
+        "redirect_uri": redirect_uri,
+        "client_id": client["client_id"],
+        "code_verifier": verifier,
+        "resource": query["resource"],
+    })
+    print(f"Token type {token.get('token_type')}, expires in {token.get('expires_in', '?')}s.", file=sys.stderr)
+    print(token["access_token"])
+    return 0
+
+
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--protocol-version", default=LATEST_PROTOCOL_VERSION)
     parser.add_argument("--client-name", default="mcp-probe")
@@ -966,6 +1095,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--timeout", type=float)
     run.add_argument("--quiet", action="store_true")
     run.set_defaults(func=run_path)
+
+    login = sub.add_parser("login", help="Get an OAuth access token for an HTTP endpoint; prints it to stdout.")
+    login.add_argument("--url", required=True)
+    login.add_argument("--scope", help="Defaults to the scopes the server advertises.")
+    login.add_argument("--port", type=int, default=8765, help="Loopback port for the redirect.")
+    login.add_argument("--timeout", type=float, default=300.0, help="Seconds to wait for the browser callback.")
+    login.set_defaults(func=oauth_login)
 
     diff = sub.add_parser("diff", help="Compare step outcomes in two transcripts.")
     diff.add_argument("a")

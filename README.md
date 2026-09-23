@@ -68,9 +68,9 @@ The nine files in `paths/` are reusable examples and the verification suite. The
 
 ## Scope and non-goals
 
-One server, an ordered path, exact JSON sends, optional outcome expectations, local transcripts, and a shallow diff. The client answers server requests minimally and masks supplied env values and auth-like headers in run artifacts. Arbitrary response data can still be private; never commit credentials or unmasked transcripts.
+One server, an ordered path, exact JSON sends, optional outcome expectations, local transcripts, and a shallow diff. `login` fetches an OAuth token for servers that use dynamic client registration. The client answers server requests minimally and masks supplied env values and auth-like headers in run artifacts. Arbitrary response data can still be private; never commit credentials or unmasked transcripts.
 
-There is no test-case generator, assertion language, OAuth, MCP Apps, tasks, subscriptions, sampling or elicitation workflow, conformance grading, compatibility matrix, replay engine, redaction framework, multi-server orchestration, web UI, or PyPI package. Raw arrays can be sent, but batch responses are not parsed. Full result comparisons belong to the agent or `jq`.
+OAuth stops at `login`, which prints an access token; there is no token storage or refresh. There is no test-case generator, assertion language, MCP Apps, tasks, subscriptions, sampling or elicitation workflow, conformance grading, compatibility matrix, replay engine, redaction framework, multi-server orchestration, web UI, or PyPI package. Raw arrays can be sent, but batch responses are not parsed. Full result comparisons belong to the agent or `jq`.
 
 ## Requirements
 
