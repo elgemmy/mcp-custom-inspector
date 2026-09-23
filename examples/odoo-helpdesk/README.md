@@ -39,7 +39,7 @@ Every property in `create_helpdesk_ticket`'s schema is required, and optional fi
 
 For each folder under `tools/`:
 
-1. Settings → Technical → Server Actions → New. Name it with `server_action_name` from `meta.json`, model **Helpdesk Ticket**, type **Execute Code**.
+1. Settings → Technical → Server Actions → New. Name it with `server_action_name` from `meta.json`, model **AI Tool** (`ai.tool`, where Odoo's own AI tools live), type **Execute Code**.
 2. Paste `code.py` into the code editor.
 3. On the **Usage** tab, enable **Use in AI**, set the tool name and the AI tool description from `meta.json`.
 4. Enter the schema: add one row per property from `schema.json` (name, type, description, required), or use **Edit** to paste the JSON directly.
@@ -72,12 +72,14 @@ Add `--trace runs/odoo.jsonl` to append a `call` event per step with the `expect
 Recorded by inspection. Items marked *not yet verified* need the demo database and must not be guessed.
 
 1. **Probe path format and existing features.** Paths are `{name, description, server, handshake, timeout, steps}`, with raw `send` steps and `method`/`params` sugar steps. The string `expect` (`result`/`error`/`none`/`timeout`) already existed and flips the exit code; it cannot tell a tool error (`result.isError: true`) from success. An auth header was possible only through `--header`, which puts the token on the command line; there was no trace. `--bearer-env`, `--trace`, and the object form of `expect` were added for this example.
-2. **AI Tool model and field names.** *Not yet verified.*
-3. **Schema storage (JSON or rows) and `enum` round trip.** *Not yet verified.*
-4. **Empty schema accepted for `list_helpdesk_teams`.** *Not yet verified.*
-5. **How `UserError` surfaces over MCP.** *Not yet verified.*
-6. **Server-side validation of `tools/call` arguments.** *Not yet verified.* `malformed.json` answers it: a `protocol_error` or an error that does not come from `code.py` means the server rejected the input itself.
-7. **Private team invisible to a limited user.** *Not yet verified.*
-8. **JSON-2 or XML-RPC on the demo database.** *Not yet verified.*
-9. **`helpdesk.ticket.ticket_ref` exists.** *Not yet verified.* The code falls back to the record id.
+2. **AI Tool model and field names.** Odoo's own AI tools are server actions on `ai.tool` (an abstract model with no table), so these tools use it too. Fields on `ir.actions.server`: `use_in_ai` (Use in AI), `ai_tool_name`, `ai_tool_description`, `ai_tool_schema` (AI Schema), `use_in_mcp` (Available in MCP), `is_readonly` (Readonly Tool), and `code`. Checked on Odoo 20.1 (`saas~20.1` master, 2026-09-23).
+3. **Schema storage.** `ai_tool_schema` is JSON text, and `enum` and `maxLength` survive a round trip.
+4. **Empty schema.** Accepted: `list_helpdesk_teams` with `{"type": "object", "properties": {}, "required": []}` is listed and callable over MCP.
+5. **How `UserError` surfaces over MCP.** As a tool error: `result.isError: true` with the message as the text content, never a JSON-RPC `error`. Odoo JSON-encodes the text, so it arrives with surrounding quotes (`"\"No helpdesk team matches 'Billing'.\""`). An unknown tool name is a tool error too.
+6. **Server-side validation of `tools/call` arguments.** Odoo checks the schema before the code runs for types (`The type of the parameter 'priority' is incorrect`), required properties, `enum` (`Wrong value super-urgent, should be in: …`), and unknown properties (`Missing definition for assignee`). It does **not** enforce `maxLength`: a 500-character subject reached the code, which truncated it to 200. `arguments` sent as a JSON string instead of an object is not caught cleanly and leaks a Python error (`'str' object has no attribute 'update'`). All rejections are tool errors.
+7. **Private team.** *Not verified*: the runs used an administrator, who sees every team.
+8. **External API.** JSON-2 (`/json/2/<model>/<method>`) is available on Odoo 20.1.
+9. **`ticket_ref`.** Present on `helpdesk.ticket` (`#00035`).
 10. **Probe invocation.** `python3 mcp_probe.py` from the repository root, as in the README and skill (the file is also executable).
+11. **Unknown customer email.** The ticket is created with `partner_email`, but Helpdesk then creates a contact with that email and an empty name. The code's "no contact" intent does not hold.
+12. **OAuth.** `mcp_probe.py login` works unchanged: discovery from the 401, dynamic client registration, and PKCE. MCP is at `/mcp`, and the authorization server is `/oauth/mcp`, advertising scope `mcp`.
