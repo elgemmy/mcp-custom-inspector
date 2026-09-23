@@ -16,12 +16,14 @@ In scope (the core):
 - Diff two transcripts, aligned by step, ignoring volatile fields.
 - Keep the existing ad-hoc mode (`stdio` / `http` subcommands with `--discover`, `--raw`, `--interactive`) unchanged. It is already tested and useful for poking around before writing a path.
 - Mask secrets (env values, auth-ish headers) in transcripts and summaries.
+- `--bearer-env NAME` sends `Authorization: Bearer` from an environment variable, so a token never sits on the command line.
+- `--trace PATH` appends one flushed JSONL event per run start, step, and run end, so another program can follow runs live.
 - A `login` subcommand that gets an OAuth access token for an HTTP server (discovery, dynamic client registration, authorization code + PKCE) and prints it for `--header`. Nothing more: no token storage or refresh, and no other auth flows.
 
 Out of scope (a hard boundary for humans and agents alike):
 
 - Generating test cases from tool schemas. The agent does this using the skill, from `tools/list` output. If a generator ever exists it is a separate script, not part of the probe.
-- An assertion language beyond the four outcome expectations. Deeper checks are the agent's job reading the summary, or `jq` on the transcript.
+- An assertion language beyond the four outcome expectations. An `expect` object is copied into the trace for its reader, never evaluated. Deeper checks are the agent's job reading the summary, or `jq` on the transcript.
 - OAuth beyond `login` (token caching, refresh, client credentials, pre-registered clients), MCP Apps, tasks, subscriptions, sampling, elicitation UI. Server-initiated requests are answered minimally (`ping` and `roots/list` get empty results, anything else gets `-32601`) and logged, nothing more.
 - Conformance grading, compatibility matrices, replay engines, redaction frameworks, multi-server orchestration, a web UI, a package on PyPI.
 - JSON-RPC batching (removed in 2025-06-18). If you want to test a server's reaction to a batch, put a raw array in a step; the probe will send it and record whatever comes back, but it will not parse batch responses.
@@ -31,7 +33,7 @@ Out of scope (a hard boundary for humans and agents alike):
 ## Layout
 
 - `mcp_probe.py`: the Python 3.10+ CLI.
-- `paths/`: nine curated paths, also the verification suite.
+- `paths/`: ten curated paths, also the verification suite.
 - `examples/`: initialize payloads for ad-hoc mode.
 - `runs/`: local transcripts, ignored except `.gitkeep`.
 - `.agents/skills/mcp-probe/SKILL.md`: usage instructions.
@@ -43,7 +45,7 @@ Out of scope (a hard boundary for humans and agents alike):
 
 Run `python3 -m py_compile mcp_probe.py`.
 Run `python3 mcp_probe.py run paths/discover.json` and `python3 mcp_probe.py run paths/handshake-missing-protocol-version.json` against the Everything server; both should exit 0.
-Run all nine curated paths before a PR and check their expectations.
+Run all ten curated paths before a PR and check their expectations.
 Run `python3 mcp_probe.py run paths/handshake-valid.json`, then `python3 mcp_probe.py diff VALID.jsonl MISSING.jsonl` using the transcript paths from the summaries; expect exit 2 and one differing step.
 The paths are the tests. Do not add pytest, `tests/`, or `scripts/`.
 

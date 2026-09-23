@@ -43,6 +43,8 @@ For a non-object payload, `wait:true` observes the next message.
 An optional `expect` accepts only `result`, `error`, `none`, or `timeout`.
 `none` and `timeout` both match silence; set `wait:true` on notifications when testing silence.
 Without `expect`, the outcome is recorded without an assertion.
+`expect` may instead be `{"outcome":"success|error|tool_error|protocol_error","result_contains":[...],"note":"..."}`:
+it is copied into the summary and trace for a reader to judge and never changes `ok` or the exit code.
 There are no variables, references, loops, conditions, or additional assertions.
 If you need a URI from discovery, read that run and write a second path with the literal URI.
 
@@ -78,12 +80,17 @@ Use the actual `transcript` paths from the summaries. Place run flags before
 `--server-cmd --`; everything after it belongs to the server.
 `--url`, repeated `--env K=V`, and repeated `--header 'N: V'` override the target.
 For an OAuth-protected HTTP server, get a token first; the user approves in the browser,
-and the token goes to a file so it never lands in the conversation:
+and the token goes to a file so it never lands in the conversation. Pass it through an
+environment variable with `--bearer-env`, never on the command line:
 
 ```bash
 python3 mcp_probe.py login --url https://example.com/mcp > TOKEN_FILE
-python3 mcp_probe.py run PATH --header "Authorization: Bearer $(cat TOKEN_FILE)"
+MCP_TOKEN=$(cat TOKEN_FILE) python3 mcp_probe.py run PATH --bearer-env MCP_TOKEN
 ```
+
+`--trace FILE` appends `run_start`, one `call` per step, and `run_end` events to a JSONL file
+that a dashboard can tail. Each call's `outcome` is `success`, `tool_error` (`isError: true`),
+`protocol_error`, `transport_error`, or `sent`.
 
 `login` needs the server to support dynamic client registration and waits up to 300 seconds for the callback on `127.0.0.1:8765`.
 When you start an HTTP server yourself, keep its PID and stop its whole process tree (`npx` spawns a child `node`);

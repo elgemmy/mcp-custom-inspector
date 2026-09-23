@@ -43,9 +43,11 @@ Both runs should exit 0: the first expects a result, the second an error. Diff e
 }
 ```
 
-Raw `send` accepts any JSON value. The other step shape, `{"method":"tools/list","params":{}}`, supplies JSON-RPC framing and an ID; `notify:true` omits the ID. Optional expectations are exactly `result`, `error`, `none`, and `timeout`. No expectation means record only. Use `wait:true` to observe silence after a notification; `none` and `timeout` both match a timeout.
+Raw `send` accepts any JSON value. The other step shape, `{"method":"tools/list","params":{}}`, supplies JSON-RPC framing and an ID; `notify:true` omits the ID. Optional expectations are exactly `result`, `error`, `none`, and `timeout`. No expectation means record only. Use `wait:true` to observe silence after a notification; `none` and `timeout` both match a timeout. An `expect` object (`outcome`, `result_contains`, `note`) is recorded for a trace reader and never checked.
 
 Automatic handshake is the default unless a step sends initialize. Set `handshake:false` to send only your written sequence, or supply an initialize-params object. A server block can also contain `http` and `headers`. See [SPEC.md](SPEC.md) for the durable format and semantics.
+
+`run --bearer-env NAME` sends a bearer token read from an environment variable, keeping it off the command line. `run --trace PATH` appends a flushed JSONL event per run start, step, and run end, with each call classified as `success`, `tool_error`, `protocol_error`, or `transport_error`; see SPEC.md.
 
 Summaries are JSON on stdout, progress is on stderr, and transcripts stay in gitignored `runs/`. Diff compares step outcomes, HTTP statuses, errors, result keys, and the server exit code. Text output counts differing steps; `--json` lists changed fields. Exit codes are 0 for success, 1 for input/startup errors, 2 for mismatches/differences, and 3 for an aborted run.
 
@@ -64,7 +66,7 @@ The [MCP Probe usage skill](.agents/skills/mcp-probe/SKILL.md) explains how to c
 
 Example prompt: “Write a path that checks whether this server survives a request with no jsonrpc field and can still list tools afterwards.”
 
-The nine files in `paths/` are reusable examples and the verification suite. The skill also shows how to run the missing-version path against Notion with a dummy token; initialize payloads for ad-hoc use remain in `examples/`.
+The ten files in `paths/` are reusable examples and the verification suite. The skill also shows how to run the missing-version path against Notion with a dummy token; initialize payloads for ad-hoc use remain in `examples/`.
 
 ## Scope and non-goals
 
