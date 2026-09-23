@@ -68,6 +68,8 @@ Example prompt: “Write a path that checks whether this server survives a reque
 
 The ten files in `paths/` are reusable examples and the verification suite. The skill also shows how to run the missing-version path against Notion with a dummy token; initialize payloads for ad-hoc use remain in `examples/`.
 
+For a worked example against a real server, see [Odoo helpdesk tools over MCP](examples/odoo-helpdesk/README.md).
+
 ## Scope and non-goals
 
 One server, an ordered path, exact JSON sends, optional outcome expectations, local transcripts, and a shallow diff. `login` fetches an OAuth token for servers that use dynamic client registration. The client answers server requests minimally and masks supplied env values and auth-like headers in run artifacts. Arbitrary response data can still be private; never commit credentials or unmasked transcripts.

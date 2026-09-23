@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "properties": {
+    "subject": {"type": "string", "description": "Short summary of the issue", "maxLength": 200},
+    "description": {"type": "string", "description": "Full details of the problem", "maxLength": 2000},
+    "priority": {
+      "type": "string",
+      "description": "One of: low, medium, high, urgent",
+      "enum": ["low", "medium", "high", "urgent"],
+      "maxLength": 10
+    },
+    "team": {"type": "string", "description": "Helpdesk team name, or empty string for no specific team", "maxLength": 100},
+    "customer_email": {"type": "string", "description": "Customer's email, or empty string if unknown", "maxLength": 200}
+  },
+  "required": ["subject", "description", "priority", "team", "customer_email"]
+}

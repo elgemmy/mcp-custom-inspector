@@ -1,0 +1,7 @@
+{
+  "tool_name": "list_helpdesk_teams",
+  "server_action_name": "AI Tool: List Helpdesk Teams",
+  "description": "List the helpdesk teams the current user can access. Read-only.",
+  "available_in_mcp": true,
+  "readonly": true
+}

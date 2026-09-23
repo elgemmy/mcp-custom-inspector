@@ -1,0 +1,11 @@
+{
+  "name": "odoo-helpdesk-smoke",
+  "description": "Both helpdesk tools are exposed and the happy path creates a routed ticket",
+  "handshake": "auto",
+  "timeout": 30,
+  "steps": [
+    {"label": "tools-list", "method": "tools/list", "expect": {"outcome": "success", "result_contains": ["create_helpdesk_ticket", "list_helpdesk_teams"], "note": "Both helpdesk tools are exposed over MCP."}},
+    {"label": "list-teams", "method": "tools/call", "params": {"name": "list_helpdesk_teams", "arguments": {}}, "expect": {"outcome": "success", "result_contains": ["Technical Support"], "note": "The demo user can see the public teams."}},
+    {"label": "happy-path", "method": "tools/call", "params": {"name": "create_helpdesk_ticket", "arguments": {"subject": "Label printer offline", "description": "The label printer in the warehouse stopped printing this morning.", "priority": "high", "team": "Technical Support", "customer_email": "contact@brasserie-confluent.example"}}, "expect": {"outcome": "success", "result_contains": ["team: Technical Support"], "note": "A valid request creates a ticket routed to the named team."}}
+  ]
+}
