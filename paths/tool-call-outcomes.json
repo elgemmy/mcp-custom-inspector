@@ -1,0 +1,15 @@
+{
+  "name": "tool-call-outcomes",
+  "description": "Record success, tool error and protocol error outcomes with expect objects for --trace",
+  "server": {"stdio": ["npx", "-y", "@modelcontextprotocol/server-everything"]},
+  "handshake": "auto",
+  "steps": [
+    {"method": "tools/call", "params": {"name": "echo", "arguments": {"message": "hello probe"}},
+     "expect": {"outcome": "success", "result_contains": ["hello probe"], "note": "Echo returns the message it was given."}},
+    {"method": "tools/call", "params": {"name": "echo", "arguments": {}},
+     "expect": {"outcome": "error", "note": "A missing required argument must be rejected."}},
+    {"method": "tools/call", "params": {"name": "no-such-tool", "arguments": {}},
+     "expect": {"outcome": "error", "note": "An unknown tool name must be rejected."}},
+    {"method": "tools/list", "expect": "result", "label": "still alive"}
+  ]
+}

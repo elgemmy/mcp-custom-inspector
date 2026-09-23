@@ -1,0 +1,12 @@
+{
+  "name": "odoo-helpdesk-validation",
+  "description": "The create tool rejects bad business input instead of silently dropping it",
+  "handshake": "auto",
+  "timeout": 30,
+  "steps": [
+    {"label": "unknown-team", "method": "tools/call", "params": {"name": "create_helpdesk_ticket", "arguments": {"subject": "Invoice shows the wrong VAT number", "description": "The label printer in the warehouse stopped printing this morning.", "priority": "high", "team": "Billing", "customer_email": "contact@brasserie-confluent.example"}}, "expect": {"outcome": "error", "note": "An unknown team must be rejected, not silently dropped."}},
+    {"label": "blank-subject", "method": "tools/call", "params": {"name": "create_helpdesk_ticket", "arguments": {"subject": "   ", "description": "The label printer in the warehouse stopped printing this morning.", "priority": "high", "team": "Technical Support", "customer_email": "contact@brasserie-confluent.example"}}, "expect": {"outcome": "error", "note": "A whitespace-only subject must be rejected."}},
+    {"label": "bad-priority", "method": "tools/call", "params": {"name": "create_helpdesk_ticket", "arguments": {"subject": "Label printer offline", "description": "The label printer in the warehouse stopped printing this morning.", "priority": "super-urgent", "team": "Technical Support", "customer_email": "contact@brasserie-confluent.example"}}, "expect": {"outcome": "error", "note": "A priority outside the enum must be rejected, by the schema or by the code."}},
+    {"label": "unknown-email", "method": "tools/call", "params": {"name": "create_helpdesk_ticket", "arguments": {"subject": "Question about opening hours", "description": "The label printer in the warehouse stopped printing this morning.", "priority": "high", "team": "Technical Support", "customer_email": "someone@unknown-customer.example"}}, "expect": {"outcome": "success", "result_contains": ["team: Technical Support"], "note": "An unknown email still creates the ticket, routed to the named team."}}
+  ]
+}

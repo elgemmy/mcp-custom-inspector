@@ -1,0 +1,7 @@
+{
+  "tool_name": "create_helpdesk_ticket",
+  "server_action_name": "AI Tool: Create Helpdesk Ticket",
+  "description": "Create one helpdesk ticket. Use only when the user explicitly asks to open, report, or log a support issue. Returns the ticket reference.",
+  "available_in_mcp": true,
+  "readonly": false
+}

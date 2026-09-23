@@ -681,7 +681,14 @@ def load_path(args: argparse.Namespace) -> tuple[Json, list[tuple[int, Json, Any
         url = server["http"]
         require(isinstance(url, str) and url.startswith(("http://", "https://")), "http must be an HTTP URL")
     secrets = []
-    for key, overrides in (("env", parse_key_value(args.env, "--env")), ("headers", parse_header(args.header))):
+    header_overrides = parse_header(args.header)
+    if args.bearer_env:
+        token = os.environ.get(args.bearer_env, "")
+        if not token:
+            raise SystemExit(f"--bearer-env: environment variable {args.bearer_env} is unset or empty.")
+        header_overrides["Authorization"] = f"Bearer {token}"
+        secrets.append(token)
+    for key, overrides in (("env", parse_key_value(args.env, "--env")), ("headers", header_overrides)):
         values = server.get(key, {})
         require(isinstance(values, dict) and all(isinstance(v, str) for v in values.values()), f"{key} must map names to strings")
         for mapping in (values, overrides):
@@ -708,7 +715,15 @@ def load_path(args: argparse.Namespace) -> tuple[Json, list[tuple[int, Json, Any
             require(isinstance(step.get("params", {}), dict), f"step {n} params must be an object")
         for key in ("wait", "notify"):
             require(key not in step or type(step[key]) is bool, f"step {n} {key} must be boolean")
-        require("expect" not in step or step["expect"] in ("result", "error", "none", "timeout"), f"step {n} has invalid expect")
+        expect = step.get("expect")
+        if isinstance(expect, dict):
+            require(not set(expect) - {"outcome", "result_contains", "note"}
+                    and expect.get("outcome") in ("success", "error", "tool_error", "protocol_error")
+                    and isinstance(expect.get("result_contains", []), list)
+                    and all(isinstance(s, str) for s in expect.get("result_contains", []))
+                    and isinstance(expect.get("note", ""), str), f"step {n} has an invalid expect object")
+        else:
+            require("expect" not in step or expect in ("result", "error", "none", "timeout"), f"step {n} has invalid expect")
         require("label" not in step or isinstance(step["label"], str), f"step {n} label must be text")
     used_ids = [id_of(s["send"]) for s in steps if "send" in s]
     next_id = 1
@@ -790,6 +805,14 @@ def path_exchange(probe: Any, message: Any, wait: bool, timeout: float) -> tuple
     return NO_RESPONSE, status
 
 
+def trace_outcome(outcome: str, response: Any) -> str:
+    """Classify a step for ``--trace``: success, tool_error, protocol_error, transport_error, or sent."""
+    if outcome == "result":
+        result = response.get("result")
+        return "tool_error" if isinstance(result, dict) and result.get("isError") is True else "success"
+    return {"error": "protocol_error", "sent": "sent"}.get(outcome, "transport_error")
+
+
 def run_path(args: argparse.Namespace) -> int:
     path, steps, secrets = load_path(args)
     server, timeout = path["server"], path["timeout"]
@@ -797,6 +820,18 @@ def run_path(args: argparse.Namespace) -> int:
     started, clock = now_iso(), time.monotonic()
     destination = Path(args.out) / f"{path['name']}-{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%S%fZ}.jsonl"
     destination.parent.mkdir(parents=True, exist_ok=True)
+    run_id, counts = destination.stem, dict.fromkeys(("success", "tool_error", "protocol_error", "transport_error"), 0)
+    trace_file = open(args.trace, "a", encoding="utf-8") if args.trace else None
+
+    def trace(event: Json) -> None:
+        if trace_file:
+            trace_file.write(compact_json(mask_secrets({"run_id": run_id, **event}, secrets)) + "\n")
+            trace_file.flush()
+
+    auth = transport == "http" and any(k.lower() == "authorization" for k in server.get("headers", {}))
+    trace(dict(type="run_start", ts=started, name=path["name"], server=server.get("http") or server.get("stdio"),
+               transport=transport, auth_mode="bearer-env" if args.bearer_env else "header" if auth else "none",
+               auth_env=args.bearer_env, path_file=args.path, transcript=str(destination)))
     summary = dict(name=path["name"], transport=transport, server=server, started=started,
                    transcript=str(destination), steps=[], server_requests=[], unsolicited=0, server_exit_code=None, ok=True)
     code, matched = 0, []
@@ -808,7 +843,7 @@ def run_path(args: argparse.Namespace) -> int:
                 probe.start()
             for n, step, message in steps:
                 logger.step = n
-                tick = time.monotonic()
+                tick, ts_start = time.monotonic(), now_iso()
                 wait = step.get("wait", isinstance(message, dict) and "id" in message)
                 result, status, failure = None, None, None
                 try:
@@ -822,7 +857,7 @@ def run_path(args: argparse.Namespace) -> int:
                 except (OSError, ValueError, http.client.HTTPException) as exc:
                     outcome, failure, code = "closed", str(exc), 3
                 expected = step.get("expect")
-                ok = expected is None or outcome == ("timeout" if expected == "none" else expected)
+                ok = not isinstance(expected, str) or outcome == ("timeout" if expected == "none" else expected)
                 row = dict(n=n, label=step.get("label"), method=method_of(message), id=id_of(message),
                            outcome=outcome, error={k: result["error"].get(k) for k in ("code", "message")} if isinstance(result, dict) and isinstance(result.get("error"), dict) else None,
                            result_keys=sorted(result["result"]) if isinstance(result, dict) and isinstance(result.get("result"), dict) else None,
@@ -832,6 +867,12 @@ def run_path(args: argparse.Namespace) -> int:
                 if failure:
                     row.update(transport_error=failure, stderr_tail=list(getattr(probe, "_stderr_tail", [])))
                 if n:
+                    call_outcome = trace_outcome(outcome, result)
+                    counts[call_outcome] = counts.get(call_outcome, 0) + 1
+                    trace(dict(type="call", step_id=n, label=step.get("label"), ts_start=ts_start,
+                               latency_ms=row["elapsed_ms"], method=method_of(message), request=message,
+                               response=result if isinstance(result, dict) else None, outcome=call_outcome,
+                               expect=expected, http_status=status))
                     summary["steps"].append(row)
                     if not args.quiet:
                         print(mask_secrets(f"{n}: {outcome}" + (" (unexpected)" if not ok else ""), secrets), file=sys.stderr)
@@ -853,6 +894,9 @@ def run_path(args: argparse.Namespace) -> int:
         summary["unsolicited"] = sum(not any(m is reply for reply in matched) and m not in summary["server_requests"] for m in logger.received)
         summary.update(elapsed_ms=round((time.monotonic() - clock) * 1000), ok=code == 0)
         print(compact_json(logger.summary(summary)))
+    trace(dict(type="run_end", ts=now_iso(), counts=counts, exit_code=code))
+    if trace_file:
+        trace_file.close()
     return code
 
 
@@ -1092,6 +1136,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--url")
     run.add_argument("--env", action="append")
     run.add_argument("--header", action="append")
+    run.add_argument("--bearer-env", metavar="NAME", help="Send 'Authorization: Bearer $NAME'; the value never appears in output.")
+    run.add_argument("--trace", metavar="PATH", help="Append run_start/call/run_end events to this JSONL file.")
     run.add_argument("--timeout", type=float)
     run.add_argument("--quiet", action="store_true")
     run.set_defaults(func=run_path)

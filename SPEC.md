@@ -24,12 +24,14 @@ In scope (the core):
 - Diff two transcripts, aligned by step, ignoring volatile fields.
 - Keep the existing ad-hoc mode (`stdio` / `http` subcommands with `--discover`, `--raw`, `--interactive`) unchanged. It is already tested and useful for poking around before writing a path.
 - Mask secrets (env values, auth-ish headers) in transcripts and summaries.
+- `--bearer-env NAME` sends `Authorization: Bearer` from an environment variable, so a token never sits on the command line.
+- `--trace PATH` appends one flushed JSONL event per run start, step, and run end, so another program can follow runs live.
 - A `login` subcommand that gets an OAuth access token for an HTTP server (discovery, dynamic client registration, authorization code + PKCE) and prints it for `--header`. Nothing more: no token storage or refresh, and no other auth flows.
 
 Out of scope (write these in the README so nobody, human or agent, drifts back into them):
 
 - Generating test cases from tool schemas. The agent does this using the skill, from `tools/list` output. If a generator ever exists it is a separate script, not part of the probe.
-- An assertion language beyond the four outcome expectations. Deeper checks are the agent's job reading the summary, or `jq` on the transcript.
+- An assertion language beyond the four outcome expectations. An `expect` object is copied into the trace for its reader, never evaluated. Deeper checks are the agent's job reading the summary, or `jq` on the transcript.
 - OAuth beyond `login` (token caching, refresh, client credentials, pre-registered clients), MCP Apps, tasks, subscriptions, sampling, elicitation UI. Server-initiated requests are answered minimally (see 6.4) and logged, nothing more.
 - Conformance grading, compatibility matrices, replay engines, redaction frameworks, multi-server orchestration, a web UI, a package on PyPI.
 - JSON-RPC batching (removed in 2025-06-18). If you want to test a server's reaction to a batch, put a raw array in a step; the probe will send it and record whatever comes back, but it will not parse batch responses.
@@ -84,6 +86,7 @@ Step shapes, exactly two:
 Optional on any step:
 
 - `expect`: one of `"result"`, `"error"`, `"none"`, `"timeout"`. `"none"` means "I sent something and expect no message back within the timeout" and is the same thing as `"timeout"` from the wire's point of view; both names are accepted because one reads naturally for notifications and the other for hangs. When `expect` is set and the outcome differs, the step is marked `ok: false` and the run exits 2. When `expect` is absent, the step is always `ok: true` and you are just recording.
+- `expect` may instead be an object, `{"outcome": "success" | "error" | "tool_error" | "protocol_error", "result_contains": ["..."], "note": "..."}`. The probe validates its shape and copies it into the summary and the `--trace` call event; it never evaluates it and it never changes `ok` or the exit code. `error` means either error kind. It exists so a live viewer can judge a call against what its author meant.
 - `wait`: `true` / `false` to override the id-based default. Expectations do not change that default; use `wait: true` when testing notification silence.
 - `label`: free text, echoed in the summary so a diff reads well.
 
@@ -160,6 +163,18 @@ Summary (stdout, one object):
 Each transcript ends with a `{"summary": {...}}` record containing this same masked summary. It records non-wire facts such as timeouts and shutdown status so `diff` does not need a separate summary file. Wire-event directions remain the six listed above.
 
 `result_keys` is the sorted top-level key list of `result` when the outcome is `result`; the full result lives in the transcript. `method` is lifted from the sent message when it is an object with a `method`, otherwise `null`. That is enough for an agent to decide what to look at next without the summary becoming the transcript.
+
+### Trace
+
+`run --trace PATH` appends events to `PATH` (one JSON object per line, flushed per line) so a dashboard can tail one file across runs:
+
+```json
+{"run_id":"…","type":"run_start","ts":"…","name":"…","server":"https://host/mcp","transport":"http","auth_mode":"bearer-env","auth_env":"TOKEN","path_file":"…","transcript":"…"}
+{"run_id":"…","type":"call","step_id":1,"label":null,"ts_start":"…","latency_ms":123,"method":"tools/call","request":{…},"response":{…},"outcome":"success","expect":{…},"http_status":200}
+{"run_id":"…","type":"run_end","ts":"…","counts":{"success":3,"tool_error":1,"protocol_error":0,"transport_error":0},"exit_code":0}
+```
+
+`run_id` is the transcript file stem. `auth_mode` is `bearer-env`, `header` (an Authorization `--header` or path header), or `none`. Only numbered steps produce `call` events. `request` is the exact payload sent; `response` is the matched reply, or `null`. `outcome` is `success` (a `result`, and `result.isError` is not `true`), `tool_error` (`result.isError: true`), `protocol_error` (a JSON-RPC `error`), `transport_error` (timeout, closed pipe, or an HTTP reply with no JSON-RPC body), or `sent` (an unawaited send). Events are masked like the transcript.
 
 ## 8. diff
 
